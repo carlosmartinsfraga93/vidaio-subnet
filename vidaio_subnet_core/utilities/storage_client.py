@@ -2,6 +2,7 @@ from minio import Minio
 import os
 import asyncio
 import datetime
+from datetime import timedelta
 import boto3
 from botocore.exceptions import ClientError
 from botocore.client import Config
@@ -489,15 +490,15 @@ class HippiusClient:
     async def upload_file(self, object_name, file_path):
         """
         Upload a file to Hippius storage.
-        
+
         Args:
             object_name (str): Name to give the object in storage
             file_path (str): Path to the file to upload
-            
+
         Returns:
             dict: Information about the uploaded object, including etag and version_id
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             self.executor, self.client.fput_object, self.bucket_name, object_name, file_path
         )
@@ -506,44 +507,44 @@ class HippiusClient:
     async def download_file(self, object_name, file_path):
         """
         Download a file from Hippius storage.
-        
+
         Args:
             object_name (str): Name of the object in storage
             file_path (str): Path where to save the downloaded file
-            
+
         Returns:
             dict: Information about the downloaded object
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(self.executor, self.client.fget_object, self.bucket_name, object_name, file_path)
         return {"status": "success"}
 
     async def delete_file(self, object_name):
         """
         Delete a file from Hippius storage.
-        
+
         Args:
             object_name (str): Name of the object to delete
-            
+
         Returns:
             dict: Information about the deletion operation
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(self.executor, self.client.remove_object, self.bucket_name, object_name)
         return {"status": "success"}
 
     async def list_objects(self, prefix=None, recursive=True):
         """
         List objects in the Hippius bucket.
-        
+
         Args:
             prefix (str, optional): Prefix to filter objects by
             recursive (bool): Whether to list objects recursively
-            
+
         Returns:
             list: List of objects with attributes matching other client implementations
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         objects = await loop.run_in_executor(
             self.executor, lambda: list(self.client.list_objects(self.bucket_name, prefix=prefix, recursive=recursive))
         )
@@ -553,7 +554,7 @@ class HippiusClient:
         """
         Ensure the specified bucket exists, creating it if necessary.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         exists = await loop.run_in_executor(self.executor, self.client.bucket_exists, self.bucket_name)
         if not exists:
             await loop.run_in_executor(self.executor, self.client.make_bucket, self.bucket_name)
@@ -573,7 +574,7 @@ class HippiusClient:
                 }
             ],
         }
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             self.executor, self.client.set_bucket_policy, self.bucket_name, str(policy).replace("'", '"')
         )
@@ -585,7 +586,7 @@ class HippiusClient:
         objects = await self.list_objects()
         if objects:
             object_names = [obj.object_name for obj in objects]
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 self.executor, lambda: list(self.client.remove_objects(self.bucket_name, object_names))
             )
@@ -593,15 +594,15 @@ class HippiusClient:
     async def get_presigned_url(self, object_name, expires=604800):
         """
         Generate a presigned URL for an object.
-        
+
         Args:
             object_name (str): Name of the object
             expires (int): Expiration time in seconds
-            
+
         Returns:
             str: Presigned URL
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         url = await loop.run_in_executor(
             self.executor, self.client.presigned_get_object, self.bucket_name, object_name, timedelta(seconds=expires)
         )
