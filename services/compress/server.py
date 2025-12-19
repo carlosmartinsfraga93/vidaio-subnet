@@ -260,26 +260,59 @@ async def compress_video(video: CompressPayload):
                     print(f"{compressed_video_path} does not exist.")
                 
                 # Get sharing link
-                sharing_link: Optional[str] = await storage_client.get_presigned_url(object_name)
-                print(f"sharing_link: {sharing_link}")
+                try:
+                    sharing_link: Optional[str] = await storage_client.get_presigned_url(object_name)
+                    print(f"sharing_link: {sharing_link}")
+                except Exception as url_error:
+                    logger.error(f"Failed to get presigned URL: {url_error}", exc_info=True)
+                    print(f"ERROR: Failed to get presigned URL: {url_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to get presigned URL: {str(url_error)}"
+                    )
                 
                 if not sharing_link:
-                    print("Upload failed")
+                    print("Upload failed: presigned URL is None")
                     return {"uploaded_video_url": None}
                 
-                return {
-                    "uploaded_video_url": sharing_link,
-                    "status": "success",
-                    "compressed_video_path": str(compressed_video_path)
-                }
+                # Store the path as string before returning (file is already deleted)
+                compressed_path_str = str(compressed_video_path)
+                
+                try:
+                    response = {
+                        "uploaded_video_url": sharing_link,
+                        "status": "success",
+                        "compressed_video_path": compressed_path_str
+                    }
+                    print(f"Returning response with URL: {sharing_link[:50]}...")
+                    return response
+                except Exception as response_error:
+                    logger.error(f"Failed to create response: {response_error}", exc_info=True)
+                    print(f"ERROR: Failed to create response: {response_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to create response: {str(response_error)}"
+                    )
+            except HTTPException:
+                # Re-raise HTTP exceptions as-is
+                raise
             except Exception as upload_error:
+                logger.error(f"Upload/response error: {upload_error}", exc_info=True)
+                print(f"ERROR: Upload/response error: {upload_error}")
                 raise HTTPException(
                     status_code=500, 
                     detail=f"Failed to upload compressed video: {str(upload_error)}"
                 )
         else:
+            logger.error("Video compression failed: compressed_video_path is None or file does not exist")
+            print(f"ERROR: Video compression failed - compressed_video_path: {compressed_video_path}")
             raise HTTPException(status_code=500, detail="Video compression failed")
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
+        logger.error(f"Video compression error: {e}", exc_info=True)
+        print(f"ERROR: Video compression error: {e}")
         raise HTTPException(status_code=500, detail=f"Video compression error: {str(e)}")
 
 

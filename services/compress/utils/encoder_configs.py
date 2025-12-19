@@ -28,7 +28,7 @@ ENCODER_SETTINGS = {
         "aq-mode": 2, "aq-strength": 1.0
     },
     "hevc_nvenc": {
-        "codec": "hevc_nvenc", "preset": "p4", "rc": "constqp", "cq": 22, "keyint": 50,
+        "codec": "hevc_nvenc", "preset": "p5", "rc": "constqp", "cq": 22, "keyint": 50,
         "spatial-aq": 1, "temporal-aq": 0
     },
     "h264_nvenc": {
@@ -55,24 +55,24 @@ SCENE_SPECIFIC_PARAMS = {
         'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
         'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
         'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
-        'other': {'keyint': 100},
-        'unclear': {'keyint': 100},
+        'other': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # AV1 slower, use p6 for safety
+        'unclear': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # AV1 slower, use p6 for safety
     },
     'hevc_nvenc': {  # Changed from 'HEVC_NVENC'
         'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
         'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
         'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
         'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
-        'other': {'keyint': 100},
-        'unclear': {'keyint': 100},
+        'other': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # Balanced: faster than p4, safer than p7
+        'unclear': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # Balanced: faster than p4, safer than p7
     },
     'h264_nvenc': {  # Changed from 'H264_NVENC'
         'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
         'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
         'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
         'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
-        'other': {'keyint': 100},
-        'unclear': {'keyint': 100},
+        'other': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # Balanced: faster than p4, safer than p7
+        'unclear': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 100},  # Balanced: faster than p4, safer than p7
     },
     'libx264': {
         'Screen Content / Text': {'preset': 'slow', 'tune': 'film', 'aq-mode': 1, 'aq-strength': 1.2, 'keyint': 250},
