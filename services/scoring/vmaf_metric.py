@@ -104,19 +104,39 @@ def vmaf_metric(ref_path, dist_path, output_file="vmaf_output.xml", neg_model=Fa
         float: The VMAF harmonic mean score.
     """
     
+    # Use path to downloaded model file instead of built-in version
     if neg_model:
         logger.info("Using VMAF NEG model for scoring.")
-        model_version = "version=vmaf_v0.6.1neg"
+        # Try multiple possible locations for the VMAF NEG model
+        model_paths = [
+            "/usr/local/share/vmaf/model/vmaf_v0.6.1neg.json",
+            "/usr/share/vmaf/model/vmaf_v0.6.1neg.json",
+            "./models/vmaf/vmaf_v0.6.1neg.json",
+            "services/compress/models/vmaf/vmaf_v0.6.1neg.json"
+        ]
+
+        model_version = None
+        for model_path in model_paths:
+            if os.path.exists(model_path):
+                model_version = f"path={model_path}"
+                logger.info(f"Using VMAF NEG model from: {model_path}")
+                break
+
+        # Fallback to built-in version if file not found
+        if not model_version:
+            logger.warning("VMAF NEG model file not found, trying built-in version")
+            model_version = "version=vmaf_v0.6.1neg"
     else:
         logger.info("Using standard VMAF model for scoring.")
         model_version = "version=vmaf_v0.6.1"
+
     command = [
-        "vmaf",  
+        "vmaf",
         "-r", ref_path,
         "-d", dist_path,
         "--model", model_version,
         "-out-fmt", "xml",
-        "-o", output_file  
+        "-o", output_file
     ]
     
     try:

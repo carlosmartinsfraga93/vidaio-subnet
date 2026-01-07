@@ -1,14 +1,92 @@
 
+# =============================================================================
+# DURATION-BASED PRESET SELECTION
+# =============================================================================
+# Dynamically select preset based on video duration to balance speed vs quality
+# Goal: Maximize validator scores by completing within timeout while maintaining quality
+#
+# Strategy:
+# - Short videos (0-15s): Use slower preset (p5) for better quality (more time available)
+# - Medium videos (15-30s): Use balanced preset (p4) for speed/quality balance
+# - Long videos (30-60s): Use faster preset (p3) to avoid timeout
+# - Very long videos (60s+): Use fastest preset (p2) to ensure completion
+#
+# Validator timeout: ~60-120 seconds
+# Encoding speed (approximate):
+#   p2: ~1.5-2x realtime (10s video = 5-7s encoding)
+#   p3: ~1.0-1.5x realtime (10s video = 7-10s encoding)
+#   p4: ~0.6-1.0x realtime (10s video = 10-17s encoding)
+#   p5: ~0.4-0.6x realtime (10s video = 17-25s encoding)
+#   p6: ~0.2-0.4x realtime (10s video = 25-50s encoding) - TOO SLOW
+#   p7: ~0.1-0.2x realtime (10s video = 50-100s encoding) - TOO SLOW
+
+DURATION_BASED_PRESETS = {
+    'av1_nvenc': {
+        # Duration ranges: (min_duration, max_duration): preset
+        'ranges': [
+            (0, 15, 'p5'),      # 0-15s: High quality (p5) - plenty of time
+            (15, 30, 'p4'),     # 15-30s: Balanced (p4) - safe for timeout
+            (30, 60, 'p3'),     # 30-60s: Faster (p3) - avoid timeout
+            (60, float('inf'), 'p2')  # 60s+: Fastest (p2) - ensure completion
+        ],
+        'default': 'p4'  # Fallback if duration unknown
+    },
+    'hevc_nvenc': {
+        'ranges': [
+            (0, 15, 'p5'),
+            (15, 30, 'p4'),
+            (30, 60, 'p3'),
+            (60, float('inf'), 'p2')
+        ],
+        'default': 'p4'
+    },
+    'h264_nvenc': {
+        'ranges': [
+            (0, 15, 'p5'),
+            (15, 30, 'p4'),
+            (30, 60, 'p3'),
+            (60, float('inf'), 'p2')
+        ],
+        'default': 'p4'
+    }
+}
+
+def get_preset_for_duration(codec, duration_seconds, scene_type=None):
+    """
+    Get optimal preset based on video duration to balance speed and quality.
+
+    Args:
+        codec (str): Codec name (e.g., 'av1_nvenc')
+        duration_seconds (float): Video duration in seconds
+        scene_type (str, optional): Scene type for further optimization
+
+    Returns:
+        str: Optimal preset for the given duration
+    """
+    if codec not in DURATION_BASED_PRESETS:
+        return None  # Use default from ENCODER_SETTINGS
+
+    preset_config = DURATION_BASED_PRESETS[codec]
+
+    # Find matching range
+    for min_dur, max_dur, preset in preset_config['ranges']:
+        if min_dur <= duration_seconds < max_dur:
+            return preset
+
+    # Fallback to default
+    return preset_config['default']
+
+
 # Configurable parameters for all encoders
 # Base settings, including default AQ where applicable
 ENCODER_SETTINGS = {
-    
+
     "libsvtav1": {  # Changed from "AV1_Optimized"
         "codec": "libsvtav1", "preset": "8", "crf": 30, "keyint": 50,
         # SVT-AV1 specific settings
     },
     "av1_nvenc": {
-        "codec": "av1_nvenc", "preset": "p6", "cq": 30, "keyint": 50, 'pix_fmt': 'yuv420p'
+        "codec": "av1_nvenc", "preset": "p4", "cq": 30, "keyint": 50, 'pix_fmt': 'yuv420p'  # Base preset (will be overridden by duration-based selection)
     },
     "libvpx_vp9": {  # Changed from "vp9"
         "codec": "libvpx-vp9", "deadline": "good", "cpu-used": 2, "crf": 32, "keyint": 50,
@@ -48,29 +126,30 @@ ENCODER_SETTINGS = {
 }
 
 # Scene-Specific Parameter Overrides (including AQ and keyint)
-# These are examples and need tuning based on content and codec specifics.
+# NOTE: Preset values here are BASE values - they will be overridden by duration-based selection
+# The duration-based preset selection (get_preset_for_duration) takes priority
 SCENE_SPECIFIC_PARAMS = {
     'av1_nvenc': {  # Changed from 'AV1_NVENC'
-        'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
-        'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
-        'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
-        'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
-        'other': {'keyint': 100},
-        'unclear': {'keyint': 100},
+        'Screen Content / Text': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},  # Preset set by duration
+        'Faces / People': {'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},  # Preset set by duration
+        'Animation / Cartoon / Rendered Graphics': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},  # Preset set by duration
+        'Gaming Content': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},  # Preset set by duration
+        'other': {'keyint': 100},  # Preset set by duration
+        'unclear': {'keyint': 100},  # Preset set by duration
     },
     'hevc_nvenc': {  # Changed from 'HEVC_NVENC'
-        'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
-        'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
-        'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
-        'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
+        'Screen Content / Text': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},  # Preset set by duration
+        'Faces / People': {'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},  # Preset set by duration
+        'Animation / Cartoon / Rendered Graphics': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},  # Preset set by duration
+        'Gaming Content': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},  # Preset set by duration
         'other': {'keyint': 100},
         'unclear': {'keyint': 100},
     },
     'h264_nvenc': {  # Changed from 'H264_NVENC'
-        'Screen Content / Text': {'preset': 'p7', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},
-        'Faces / People': {'preset': 'p6', 'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},
-        'Animation / Cartoon / Rendered Graphics': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},
-        'Gaming Content': {'preset': 'p5', 'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},
+        'Screen Content / Text': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 250},  # Preset set by duration
+        'Faces / People': {'spatial-aq': 1, 'temporal-aq': 1, 'keyint': 100},  # Preset set by duration
+        'Animation / Cartoon / Rendered Graphics': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 150},  # Preset set by duration
+        'Gaming Content': {'spatial-aq': 1, 'temporal-aq': 0, 'keyint': 75},  # Preset set by duration
         'other': {'keyint': 100},
         'unclear': {'keyint': 100},
     },

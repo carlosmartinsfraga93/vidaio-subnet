@@ -89,7 +89,8 @@ async def video_upscaler(payload_url: str, task_type: str) -> str | None:
             return None
 
 async def video_compressor(payload_url: str, vmaf_threshold: float, target_codec: str = "av1",
-                          codec_mode: str = "CRF", target_bitrate: float = 10.0) -> str | None:
+                          codec_mode: str = "CRF", target_bitrate: float = 10.0,
+                          validator_uid: int = None, validator_hotkey: str = None) -> str | None:
     """
     Sends a video file path to the compression service and retrieves the processed video path.
 
@@ -99,6 +100,8 @@ async def video_compressor(payload_url: str, vmaf_threshold: float, target_codec
         target_codec (str): The target codec for compression (default: "av1").
         codec_mode (str): Codec mode - CBR, VBR, or CRF (default: "CRF").
         target_bitrate (float): Target bitrate in Mbps (default: 10.0).
+        validator_uid (int): Validator UID (optional).
+        validator_hotkey (str): Validator hotkey (optional).
 
     Returns:
         str | None: The URL of the compressed video or None if an error occurs.
@@ -112,7 +115,14 @@ async def video_compressor(payload_url: str, vmaf_threshold: float, target_codec
         "codec_mode": codec_mode,
         "target_bitrate": target_bitrate,
     }
-    logger.info(f"🎬 Sending compression request: VMAF={vmaf_threshold}, Codec={target_codec}, Mode={codec_mode}, Bitrate={target_bitrate} Mbps")
+
+    # Add validator info if provided
+    if validator_uid is not None:
+        data["validator_uid"] = validator_uid
+    if validator_hotkey is not None:
+        data["validator_hotkey"] = validator_hotkey
+
+    logger.info(f"🎬 Sending compression request: VMAF={vmaf_threshold}, Codec={target_codec}, Mode={codec_mode}, Bitrate={target_bitrate} Mbps, Validator UID={validator_uid}")
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, data=json.dumps(data)) as response:
             if response.status == 200:

@@ -125,14 +125,17 @@ def load_scene_classifier_model(model_path, device='cpu', logging_enabled=True):
     # Get available metrics and class mapping (scaler is removed)
     available_metrics = checkpoint.get('available_metrics', VIDEO_METRICS)
     class_mapping = checkpoint.get('class_mapping', CLASS_MAPPING)
+    image_size = checkpoint.get('image_size', 224)  # Default to 224 for backward compatibility
+    model_type = checkpoint.get('model_type', 'mobilenet_v3_small')
 
     if logging_enabled:
         print(f"Loaded scene classifier with {len(available_metrics)} metrics")
+        print(f"  Model type: {model_type}, Image size: {image_size}x{image_size}")
 
     # Create a new model with the same architecture
     model = CombinedModel(
         num_classes=len(class_mapping) if class_mapping else 6,
-        model_type='mobilenet_v3_small',
+        model_type=model_type,
         use_pretrained=False,
         metrics_dim=len(available_metrics)
     )
@@ -142,7 +145,8 @@ def load_scene_classifier_model(model_path, device='cpu', logging_enabled=True):
     model.to(device)
     model.eval()
 
-    return checkpoint['model_state_dict'], available_metrics, class_mapping
+    confidence_threshold = checkpoint.get('confidence_threshold', 0.5)
+    return checkpoint['model_state_dict'], available_metrics, class_mapping, image_size, confidence_threshold, model_type
 
 def extract_frames_from_scene(video_path, start_time, end_time, num_frames=3, output_dir=None):
     """
@@ -232,7 +236,7 @@ def extract_frames_from_scene(video_path, start_time, end_time, num_frames=3, ou
 
     return sorted(frame_paths)  # Sort to maintain frame order
 
-def classify_scene_with_model(frame_paths, video_features, scene_classifier, metrics_scaler, available_metrics, device='cpu', logging_enabled=True):
+def classify_scene_with_model(frame_paths, video_features, scene_classifier, metrics_scaler, available_metrics, device='cpu', logging_enabled=True, image_size=224, confidence_threshold=0.5, class_mapping=None):
     """
     Classify a scene using multiple frames and the trained classifier
 
@@ -244,15 +248,16 @@ def classify_scene_with_model(frame_paths, video_features, scene_classifier, met
         available_metrics: List of available metrics for the model
         device: Device to run inference on ('cpu' or 'cuda')
         logging_enabled (bool): If True, print classification details.
+        image_size: Input image size (224 or 384, default=224)
 
     Returns:
         tuple: (classification_label, detailed_results)
         classification_label (str): Most common prediction across frames
         detailed_results (dict): Contains confidence scores and probabilities for all classes
     """
-    # Image transform
+    # Image transform with configurable size
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -337,19 +342,37 @@ def classify_scene_with_model(frame_paths, video_features, scene_classifier, met
     # Get majority class and its confidence
     majority_class = max(prediction_counts, key=prediction_counts.get)
     majority_confidence = prediction_counts[majority_class] / len(predictions)  # Normalize by number of frames
-
+    
+    # Use provided class_mapping or fallback to global CLASS_MAPPING
+    if class_mapping is None:
+        class_mapping = CLASS_MAPPING
+    inv_class_mapping = {v: k for k, v in class_mapping.items()}
+    
     # Convert to label string
-    label = INV_CLASS_MAPPING.get(majority_class, "unclear")
+    # If model only has 4 classes (no "other"), check confidence threshold
+    if len(class_mapping) == 4 or 'other' not in class_mapping:
+        # Model trained on 4 classes only - use confidence threshold for "other"
+        if majority_confidence < confidence_threshold:
+            label = "other"
+            if logging_enabled:
+                print(f"   Low confidence ({majority_confidence:.2f} < {confidence_threshold:.2f}), classifying as 'other'")
+        else:
+            label = inv_class_mapping.get(majority_class, "other")
+    else:
+        # Model has "other" class - use it directly
+        label = inv_class_mapping.get(majority_class, "unclear")
 
     #Create detailed results with individual class probabilities
+    # Handle models with only 4 classes (no "other" or "unclear" in the model output)
+    num_classes = len(avg_probabilities)
     detailed_results = {
         'confidence_score': majority_confidence,
-        'prob_screen_content': float(avg_probabilities[CLASS_MAPPING.get('Screen Content / Text', 0)]),
-        'prob_animation': float(avg_probabilities[CLASS_MAPPING.get('Animation / Cartoon / Rendered Graphics', 1)]),
-        'prob_faces': float(avg_probabilities[CLASS_MAPPING.get('Faces / People', 2)]),
-        'prob_gaming': float(avg_probabilities[CLASS_MAPPING.get('Gaming Content', 3)]),
-        'prob_other': float(avg_probabilities[CLASS_MAPPING.get('other', 4)]),
-        'prob_unclear': float(avg_probabilities[CLASS_MAPPING.get('unclear', 5)]),
+        'prob_screen_content': float(avg_probabilities[0]) if num_classes > 0 else 0.0,
+        'prob_animation': float(avg_probabilities[1]) if num_classes > 1 else 0.0,
+        'prob_faces': float(avg_probabilities[2]) if num_classes > 2 else 0.0,
+        'prob_gaming': float(avg_probabilities[3]) if num_classes > 3 else 0.0,
+        'prob_other': float(avg_probabilities[4]) if num_classes > 4 else 0.0,  # Only if model has "other" class
+        'prob_unclear': float(avg_probabilities[5]) if num_classes > 5 else 0.0,  # Only if model has "unclear" class
         'frame_predictions': [INV_CLASS_MAPPING.get(p, "unclear") for p in predictions],
         'prediction_counts': {INV_CLASS_MAPPING.get(k, "unclear"): v for k, v in prediction_counts.items()}
     }

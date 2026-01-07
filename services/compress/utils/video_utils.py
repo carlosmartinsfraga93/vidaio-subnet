@@ -1,6 +1,25 @@
 import cv2
 import numpy as np
 import subprocess
+import json
+
+def get_video_bitrate(video_path):
+    """Get the bitrate of a video file in kbps."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+
+        bitrate = data.get('format', {}).get('bit_rate')
+        if bitrate:
+            return float(bitrate) / 1000  # Convert to kbps
+        return None
+    except Exception as e:
+        print(f"Error getting bitrate for {video_path}: {e}")
+        return None
 
 def get_video_duration(video_path):
     """Get the duration of a video in seconds"""

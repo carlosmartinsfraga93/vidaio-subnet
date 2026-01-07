@@ -7,7 +7,7 @@ import re
 import time
 import traceback
 import numpy as np
-from .encoder_configs import ENCODER_SETTINGS, SCENE_SPECIFIC_PARAMS, MODEL_CQ_REFERENCE_CODEC, QUALITY_MAPPING_ANCHORS
+from .encoder_configs import ENCODER_SETTINGS, SCENE_SPECIFIC_PARAMS, MODEL_CQ_REFERENCE_CODEC, QUALITY_MAPPING_ANCHORS, get_preset_for_duration
 
 def cleanup_quality_params(settings, keep_param=None):
     """
@@ -148,23 +148,30 @@ def get_contrast_optimized_params(scene_type, contrast_value, codec):
         contrast_category = "medium"
     
     # --- NVENC-based codecs (AV1, HEVC, H264) ---
-    if codec in ["av1_nvenc", "hevc_nvenc", "h264_nvenc"]:      
-        # Set spatial AQ strength based on contrast
-        if contrast_category == "high":
-            params['spatial-aq'] = 1
-            params['aq-strength'] = 8  # Higher strength for high contrast (NVENC 1-15)
-        elif contrast_category == "low":
-            params['spatial-aq'] = 1
-            params['aq-strength'] = 4  # Lower strength for low contrast
+    if codec in ["av1_nvenc", "hevc_nvenc", "h264_nvenc"]:
+        # AV1 NVENC uses different AQ parameters than HEVC/H264 NVENC
+        if codec == "av1_nvenc":
+            # For AV1 NVENC, use 'aq' mode (not spatial-aq/temporal-aq)
+            # aq=1 enables spatial AQ
+            params['aq'] = 1  # Enable adaptive quantization
+            # Note: av1_nvenc doesn't support aq-strength parameter
         else:
-            params['spatial-aq'] = 1
-            params['aq-strength'] = 6  # Medium strength
-        
-        # Adjust temporal AQ based on scene type and contrast
-        if scene_type == 'Faces / People' and contrast_category == "high":
-            params['temporal-aq'] = 1  # Enable temporal AQ for high contrast faces
-        else:
-            params['temporal-aq'] = 0  # Default
+            # For HEVC/H264 NVENC, use spatial-aq and aq-strength
+            if contrast_category == "high":
+                params['spatial-aq'] = 1
+                params['aq-strength'] = 8  # Higher strength for high contrast (NVENC 1-15)
+            elif contrast_category == "low":
+                params['spatial-aq'] = 1
+                params['aq-strength'] = 4  # Lower strength for low contrast
+            else:
+                params['spatial-aq'] = 1
+                params['aq-strength'] = 6  # Medium strength
+
+            # Adjust temporal AQ based on scene type and contrast
+            if scene_type == 'Faces / People' and contrast_category == "high":
+                params['temporal-aq'] = 1  # Enable temporal AQ for high contrast faces
+            else:
+                params['temporal-aq'] = 0  # Default
     
     # --- x264 ---
     elif codec == "libx264":  # ✅ FIXED: Use standardized codec name
@@ -249,7 +256,7 @@ def get_contrast_optimized_params(scene_type, contrast_value, codec):
     
     return params
 
-def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, logging_enabled=True):
+def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, duration=None, skip_cq_mapping=False, logging_enabled=True, vbr_settings=None):
     """
     Encodes a video using specified codec settings, optimized for scene type and contrast.
     Audio is copied without re-encoding for efficiency.
@@ -260,22 +267,41 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
         input_path (str): Path to input video file
         output_path (str): Path for output video file
         codec (str): Video codec to use (e.g., 'av1_nvenc', 'libx264')
-        rate (int/float, optional): Quality parameter (CQ value from model)
+        rate (int/float, optional): Quality parameter (CQ value from model or codec-specific)
         preset (str, optional): Encoder preset override
         scene_type (str, optional): Scene classification for optimization
         contrast_value (float, optional): Perceptual contrast (0.0-1.0)
         codec_mode (str, optional): Encoding mode - 'CRF', 'CBR', or 'VBR'
         target_bitrate (float, optional): Target bitrate in Mbps (for CBR/VBR modes)
+        duration (float, optional): Video duration in seconds (for duration-based preset selection)
+        skip_cq_mapping (bool): Skip CQ mapping (when rate is already codec-specific)
         logging_enabled (bool): Enable detailed logging
 
     Returns:
         tuple: (encoding_results_log, encoding_time) or (None, None) on failure
     """
-    
+
+    # Get video duration if not provided
+    if duration is None:
+        try:
+            import subprocess
+            cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', input_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                duration = float(result.stdout.strip())
+                if logging_enabled:
+                    print(f"📏 Detected video duration: {duration:.1f}s")
+        except Exception as e:
+            if logging_enabled:
+                print(f"⚠️ Could not detect duration: {e}, using default preset selection")
+            duration = None
+
     if logging_enabled:
         print(f"Encoding video using codec: {codec}, scene: {scene_type}, model_predicted_rate: {rate}")
         if contrast_value is not None:
             print(f"Using contrast value: {contrast_value:.2f}")
+        if duration is not None:
+            print(f"Video duration: {duration:.1f}s")
 
     # Get base encoder settings
     base_settings = ENCODER_SETTINGS.get(codec)
@@ -295,6 +321,16 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
             if logging_enabled:
                 print(f"Applying scene-specific params for '{scene_type}': {scene_params}")
             current_settings.update(scene_params)
+
+    # 2.5. Apply duration-based preset selection (BEFORE preset override)
+    # This optimizes speed vs quality based on video length to maximize validator scores
+    if duration is not None and preset is None:  # Only if preset not explicitly provided
+        duration_preset = get_preset_for_duration(codec, duration, scene_type)
+        if duration_preset:
+            current_settings['preset'] = duration_preset
+            if logging_enabled:
+                print(f"⚡ Duration-based preset selection: {duration:.1f}s → preset '{duration_preset}'")
+                print(f"   Strategy: Balance speed/quality for validator timeout (~60-120s)")
 
     # 3. Apply contrast-specific overrides if contrast_value is provided
     if contrast_value is not None:
@@ -342,26 +378,55 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
 
         elif codec_mode.upper() == 'VBR':
             # Variable Bitrate Mode - allows bitrate to vary but caps at target
-            # We will still apply CQ/CRF for quality, but add maxrate constraint
+            # For NVENC: Use VBR_HQ mode with CQ for quality control + bitrate cap
+            # For other codecs: Use VBR with CRF for quality control
             bitrate_kbps = int(target_bitrate * 1000)
             bitrate_value = f"{bitrate_kbps}k"
+
+            # CRITICAL: Set average bitrate equal to target for quality-constrained VBR
+            # The CQ parameter controls quality floor, so we want encoder to use full bitrate budget
+            # Previous 0.75x multiplier was causing actual bitrate to be too low for VMAF targets
+            target_bitrate_kbps = bitrate_kbps  # Use 100% of target as average
+            target_bitrate_value = f"{target_bitrate_kbps}k"
 
             current_settings['maxrate'] = bitrate_value
             current_settings['bufsize'] = f"{bitrate_kbps * 2}k"
 
             # Set rate control mode for NVENC/QSV
             if codec.endswith('_nvenc') or codec.endswith('_qsv'):
-                current_settings['rc'] = 'vbr'
+                # CRITICAL FIX: Use VBR mode with CQ for quality-constrained VBR
+                # Note: av1_nvenc doesn't support vbr_hq, only vbr
+                # hevc_nvenc and h264_nvenc support vbr_hq for better quality
+
+                # Set average target bitrate for VBR mode
+                current_settings['bitrate'] = target_bitrate_value
+
+                # Use VBR_HQ for HEVC/H264, VBR for AV1
+                if codec == 'av1_nvenc':
+                    current_settings['rc'] = 'vbr'
+                    rc_mode_name = 'VBR'
+                else:
+                    current_settings['rc'] = 'vbr_hq'
+                    rc_mode_name = 'VBR_HQ'
+
                 if logging_enabled:
-                    print(f"Set rate control to VBR")
+                    print(f"Set NVENC/QSV rate control to {rc_mode_name} with CQ quality control")
+                    print(f"{rc_mode_name} mode: avg bitrate={target_bitrate_value}, maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k")
+                    print(f"   CQ will control quality floor, bitrate will be capped at maxrate")
+
+                # DO NOT skip rate application - we still want CQ for quality control
+                # skip_rate_application = False (default)
+
             elif 'libvpx' in codec:
                 # VP9/VP8 VBR mode - set target bitrate for VBR with CRF
-                current_settings['bitrate'] = bitrate_value
+                current_settings['bitrate'] = target_bitrate_value
                 if logging_enabled:
-                    print(f"Set libvpx VBR mode with target bitrate={bitrate_value}")
-
-            if logging_enabled:
-                print(f"VBR mode: maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k, will apply CQ/CRF for quality")
+                    print(f"Set libvpx VBR mode with target bitrate={target_bitrate_value}")
+                    print(f"VBR mode: maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k, will apply CRF for quality")
+            else:
+                # For software encoders (libx264, libx265, etc.), use CRF with maxrate
+                if logging_enabled:
+                    print(f"VBR mode: maxrate={bitrate_value}, bufsize={bitrate_kbps * 2}k, will apply CRF for quality")
 
         elif codec_mode.upper() == 'CRF':
             # CRF mode is the default - will apply rate parameter below
@@ -372,9 +437,23 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
             if logging_enabled:
                 print(f"Warning: Unknown codec_mode '{codec_mode}', defaulting to CRF behavior")
 
-    # 5. Apply rate (CQ) parameter with codec-specific handling (skip if CBR mode)
+    # 5. Apply rate (CQ) parameter with codec-specific handling (skip if CBR mode or if already codec-specific)
     if rate is not None and not skip_rate_application:
-        current_settings = apply_rate_mapping(codec, rate, current_settings, logging_enabled)
+        if skip_cq_mapping:
+            # Rate is already codec-specific, apply directly without mapping
+            if 'cq' in current_settings:
+                current_settings['cq'] = int(rate)
+                cleanup_quality_params(current_settings, keep_param='cq')
+                if logging_enabled:
+                    print(f"Applying codec-specific CQ directly for {codec}: {current_settings['cq']}")
+            elif 'crf' in current_settings:
+                current_settings['crf'] = int(rate)
+                cleanup_quality_params(current_settings, keep_param='crf')
+                if logging_enabled:
+                    print(f"Applying codec-specific CRF directly for {codec}: {current_settings['crf']}")
+        else:
+            # Apply mapping from reference codec (AV1) to target codec
+            current_settings = apply_rate_mapping(codec, rate, current_settings, logging_enabled)
 
     # 6. Apply preset override if provided
     if preset is not None:
@@ -402,19 +481,43 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     except Exception:
         pass
 
-    # 8. CQ policy for NVENC/QSV - use VBR with CQ (only if rc not already set by codec_mode)
+    # 8. CQ policy for NVENC/QSV
     try:
         has_cq = 'cq' in current_settings and isinstance(current_settings.get('cq'), (int, float))
         has_maxrate = 'maxrate' in current_settings
         rc_already_set = 'rc' in current_settings
+        is_vbr_mode = codec_mode and codec_mode.upper() == 'VBR'
 
         if (codec.endswith('_nvenc') or codec.endswith('_qsv')) and has_cq and not rc_already_set:
-            # Standard CQ encoding with VBR (fallback when codec_mode not specified)
-            current_settings['rc'] = 'vbr'
-            cleanup_quality_params(current_settings, keep_param='cq')
-            if logging_enabled:
-                maxrate_info = " and maxrate" if has_maxrate else ""
-                print(f"Using VBR with CQ{maxrate_info} for {codec}")
+            # For av1_nvenc, use constqp mode (newer FFmpeg versions don't support cq in VBR)
+            # However, in VBR mode, we need to keep maxrate/bufsize constraints
+            if codec == 'av1_nvenc':
+                if is_vbr_mode:
+                    # VBR mode: Use VBR rate control with CQ and keep bitrate constraints
+                    # Note: av1_nvenc doesn't support vbr_hq, only vbr
+                    current_settings['rc'] = 'vbr'
+                    if logging_enabled:
+                        print(f"Using VBR mode for {codec} with CQ={current_settings.get('cq')} and maxrate={current_settings.get('maxrate')}")
+                        print(f"   This enforces bitrate limit while maintaining quality target")
+                else:
+                    # CRF/quality mode: Use constqp and remove bitrate constraints
+                    current_settings['rc'] = 'constqp'
+                    # Remove VBR-specific parameters when using constqp as they're incompatible
+                    current_settings.pop('maxrate', None)
+                    current_settings.pop('bufsize', None)
+                    if logging_enabled:
+                        print(f"Using constqp mode for {codec} (quality-based encoding, no bitrate constraints)")
+            else:
+                # For other NVENC codecs (hevc_nvenc, h264_nvenc), use VBR_HQ with CQ
+                if is_vbr_mode:
+                    current_settings['rc'] = 'vbr_hq'
+                else:
+                    current_settings['rc'] = 'vbr'
+                cleanup_quality_params(current_settings, keep_param='cq')
+                if logging_enabled:
+                    maxrate_info = " and maxrate" if has_maxrate else ""
+                    rc_mode = current_settings.get('rc', 'vbr')
+                    print(f"Using {rc_mode.upper()} with CQ{maxrate_info} for {codec}")
     except Exception:
         pass
 
@@ -425,18 +528,55 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     key_map = {
         'keyint': 'g',
         'bitrate': 'b:v',
-        'codec': 'vcodec'
+        'codec': 'vcodec',
+        'rc': 'rc:v'  # Rate control mode for NVENC encoders
     }
 
-    # For NVENC in constqp mode, translate 'cq' to 'qp'
+    # For NVENC encoders, handle CQ/QP properly based on rate control mode
+    # CRITICAL FIX: Do NOT use -qp in VBR mode as it conflicts with rate control
     try:
-        if codec.endswith('_nvenc') and str(current_settings.get('rc', '')).lower() == 'constqp':
+        if codec.endswith('_nvenc'):
+            rc_value = current_settings.get('rc', None)
+            is_vbr_mode = rc_value in ['vbr', 'vbr_hq']
+
             if 'cq' in current_settings and 'qp' not in current_settings:
-                current_settings['qp'] = int(current_settings.pop('cq'))
-                if logging_enabled:
-                    print("Translating NVENC constqp: using -qp instead of -cq")
-    except Exception:
-        pass
+                if is_vbr_mode:
+                    # VBR mode: Remove CQ/QP entirely, rely on AQ settings for quality
+                    # Using -qp in VBR mode causes unpredictable quality issues
+                    cq_value = current_settings.pop('cq')
+                    if logging_enabled:
+                        print(f"⚠️ VBR mode detected for {codec}: Removing CQ={cq_value} (incompatible with VBR)")
+                        print(f"   Quality will be controlled by spatial-aq, temporal-aq, and aq-strength")
+
+                    # Ensure AQ settings are present for quality control
+                    if 'spatial-aq' not in current_settings:
+                        current_settings['spatial-aq'] = 1
+                    if 'temporal-aq' not in current_settings:
+                        current_settings['temporal-aq'] = 1
+                    if 'aq-strength' not in current_settings:
+                        current_settings['aq-strength'] = 8  # Higher for better quality
+                else:
+                    # CRF/constqp mode: Translate cq to qp
+                    current_settings['qp'] = int(current_settings.pop('cq'))
+                    if logging_enabled:
+                        print(f"Translating NVENC {codec}: using -qp {current_settings['qp']} for quality mode")
+
+            # For av1_nvenc, handle rc parameter based on mode
+            if codec == 'av1_nvenc' and 'qp' in current_settings:
+                # Only remove rc parameter if NOT in VBR/VBR_HQ mode
+                # VBR/VBR_HQ modes need rc parameter to enforce bitrate constraints
+                if rc_value and rc_value not in ['vbr', 'vbr_hq']:
+                    # Remove rc for non-VBR modes (constqp, etc.)
+                    current_settings.pop('rc', None)
+                    if logging_enabled:
+                        print(f"Removing 'rc={rc_value}' parameter for {codec} (using qp in quality mode)")
+                elif rc_value in ['vbr', 'vbr_hq']:
+                    # Keep rc=vbr/vbr_hq for VBR modes
+                    if logging_enabled:
+                        print(f"Keeping 'rc={rc_value}' parameter for {codec} (VBR mode with bitrate constraints)")
+    except Exception as e:
+        if logging_enabled:
+            print(f"⚠️ Error handling NVENC quality parameters: {e}")
 
     # Add all current settings to output_args
     for key, value in current_settings.items():
@@ -466,20 +606,39 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
 
     # --- Execute FFmpeg ---
     try:
-        start_time = time.time()
-        
+        # Detailed timing breakdown
+        timing_start = time.time()
+
+        if logging_enabled:
+            print(f"⏱️ [TIMING] Starting FFmpeg execution...")
+
+        # Step 1: Build FFmpeg command
+        step1_start = time.time()
         input_stream = ffmpeg.input(input_path)
         output_stream = ffmpeg.output(input_stream, output_path, **output_args)
-        
+        step1_time = time.time() - step1_start
+
+        if logging_enabled:
+            print(f"⏱️ [TIMING] FFmpeg command build: {step1_time:.3f}s")
+
+        # Step 2: Execute FFmpeg
+        step2_start = time.time()
+        if logging_enabled:
+            print(f"⏱️ [TIMING] Starting FFmpeg encoding process...")
+
         result = output_stream.run(
             overwrite_output=True,
             capture_stdout=True,
             capture_stderr=True,
             quiet=(not logging_enabled)
         )
-        
-        end_time = time.time()
-        encoding_time_calculated = round(end_time - start_time, 2)
+
+        step2_time = time.time() - step2_start
+        if logging_enabled:
+            print(f"⏱️ [TIMING] FFmpeg encoding completed: {step2_time:.3f}s")
+
+        # Step 3: Process results
+        step3_start = time.time()
         stderr = result[1].decode("utf-8") if result[1] else ""
 
         # Extract final encoding log line for debugging
@@ -489,8 +648,17 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
                 if "time=" in line:
                     encoding_results_log = line
 
+        step3_time = time.time() - step3_start
+
+        total_time = time.time() - timing_start
+        encoding_time_calculated = round(total_time, 2)
+
         if logging_enabled:
+            print(f"⏱️ [TIMING] Result processing: {step3_time:.3f}s")
+            print(f"⏱️ [TIMING] Total encode_video() time: {total_time:.3f}s")
+            print(f"⏱️ [TIMING] Breakdown: build={step1_time:.3f}s, encode={step2_time:.3f}s, process={step3_time:.3f}s")
             print(f"Successfully encoded using {codec} scene '{scene_type}': {output_path}")
+
         return encoding_results_log, encoding_time_calculated
 
     except ffmpeg.Error as e:
@@ -505,8 +673,15 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
             output_args["vcodec"] = "libsvtav1"
 
             # remove nvenc-specific options that might cause fallback errors
-            for key in ["spatial-aq", "temporal-aq", "aq-strength", "rc-lookahead", "preset"]:
+            for key in ["spatial-aq", "temporal-aq", "aq-strength", "rc-lookahead", "preset", "aq", "spatial_aq", "qp", "rc:v"]:
                 output_args.pop(key, None)
+
+            # Add libsvtav1-specific parameters
+            output_args["preset"] = "8"  # Fast preset for libsvtav1 (0=slowest, 13=fastest)
+
+            # If there's a CRF value, keep it; otherwise use default
+            if "crf" not in output_args:
+                output_args["crf"] = 35  # Default CRF for libsvtav1
 
             start_time = time.time()
             input_stream = ffmpeg.input(input_path)

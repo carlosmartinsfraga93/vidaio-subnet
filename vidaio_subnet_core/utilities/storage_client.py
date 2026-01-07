@@ -593,17 +593,17 @@ class HippiusClient:
     async def get_presigned_url(self, object_name, expires=604800):
         """
         Generate a presigned URL for an object.
-        
+
         Args:
             object_name (str): Name of the object
             expires (int): Expiration time in seconds
-            
+
         Returns:
             str: Presigned URL
         """
         loop = asyncio.get_event_loop()
         url = await loop.run_in_executor(
-            self.executor, self.client.presigned_get_object, self.bucket_name, object_name, timedelta(seconds=expires)
+            self.executor, self.client.presigned_get_object, self.bucket_name, object_name, datetime.timedelta(seconds=expires)
         )
         return url
 

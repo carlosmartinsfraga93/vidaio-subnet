@@ -12,7 +12,7 @@ from services.miner_utilities.miner_utils import video_upscaler, video_compresso
 from vidaio_subnet_core.utilities.version import check_version
 
 MAX_CONTENT_LEN = ContentLength.FIVE
-warrant_task = TaskType.UPSCALING
+warrant_task = TaskType.COMPRESSION  # Register as compression miner
 
 class Miner(BaseMiner):
     def __init__(self, config: dict | None = None) -> None:
@@ -71,13 +71,14 @@ class Miner(BaseMiner):
         codec_mode: str = synapse.miner_payload.codec_mode
         target_bitrate: float = synapse.miner_payload.target_bitrate
         validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_hotkey: str = synapse.dendrite.hotkey
 
         logger.info(f"🛜🛜🛜 Receiving CompressionRequest from validator: {synapse.dendrite.hotkey} with uid: {validator_uid} | VMAF: {vmaf_threshold} | Codec: {target_codec} | Mode: {codec_mode} | Bitrate: {target_bitrate} Mbps 🛜🛜🛜")
 
         check_version(synapse.version)
 
         try:
-            processed_video_url = await video_compressor(payload_url, vmaf_threshold, target_codec, codec_mode, target_bitrate)
+            processed_video_url = await video_compressor(payload_url, vmaf_threshold, target_codec, codec_mode, target_bitrate, validator_uid, validator_hotkey)
 
             if processed_video_url is None:
                 logger.info(f"💔 Failed to compress video 💔")

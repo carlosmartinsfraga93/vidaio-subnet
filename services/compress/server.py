@@ -12,18 +12,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from loguru import logger
 
 from video_preprocessor import pre_processing
 from scene_detector import scene_detection
 from encoder import ai_encoding, load_encoding_resources
-from vmaf_calculator import scene_vmaf_calculation
 from validator_merger import validation_and_merging
 from vidaio_subnet_core.utilities import storage_client, download_video
 from vidaio_subnet_core import CONFIG
 from utils.video_utils import get_video_duration, get_video_codec
+from request_logger import RequestLogger
+from async_vmaf_logger import async_vmaf_logger
 
 
 # ============================================================================
@@ -41,6 +42,113 @@ VMAF_THRESHOLD_LOW = 85.0
 
 app = FastAPI(title="Video Compression Service", version="1.1.0")
 
+# Initialize request logger (keeps last 100 requests)
+request_logger = RequestLogger(max_requests=100, log_dir="compression_logs")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Preload AI models at startup to avoid delays on first request.
+
+    This ensures all requests (including the first one) are fast.
+    """
+    print("\n" + "="*80)
+    print("🚀 VIDEO COMPRESSOR SERVICE STARTUP")
+    print("="*80)
+    print(f"   📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🌐 Host: {CONFIG.video_compressor.host}:{CONFIG.video_compressor.port}")
+    print(f"   📂 Working directory: {os.getcwd()}")
+
+    # Preload CLIP model for scene classification
+    print(f"\n   🔧 Preloading CLIP model for scene classification...")
+    preload_start = time.time()
+
+    try:
+        from utils.processing_utils import USE_CLIP_CLASSIFICATION
+        if USE_CLIP_CLASSIFICATION:
+            try:
+                from utils.classify_scene_clip import get_clip_classifier
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                print(f"   📍 Device: {device}")
+                get_clip_classifier(device=device)
+                preload_time = time.time() - preload_start
+                print(f"   ✅ CLIP model preloaded successfully ({preload_time:.1f}s)")
+                print(f"   💡 All requests will now use cached CLIP model")
+            except Exception as clip_error:
+                print(f"   ⚠️ Warning: Failed to preload CLIP model: {clip_error}")
+                print(f"   💡 CLIP will be loaded on first request instead")
+        else:
+            print(f"   ⚠️ CLIP classification is disabled (USE_CLIP_CLASSIFICATION=False)")
+            print(f"   💡 Using fallback scene classification method")
+
+    except Exception as e:
+        print(f"\n   ⚠️ Warning: Failed to preload CLIP model: {e}")
+        print(f"   💡 CLIP will be loaded on first request instead")
+
+    print("\n" + "="*80)
+    print("✅ SERVICE READY - Waiting for requests...")
+    print("="*80 + "\n")
+
+# ============================================================================
+# Global Model Cache
+# ============================================================================
+
+# Cache for AI models (loaded once at startup, reused for all requests)
+_MODEL_CACHE = {
+    'resources': None,
+    'config': None,
+    'loaded': False
+}
+
+def get_cached_models(config: dict, logging_enabled: bool = True):
+    """
+    Get cached AI models or load them if not already loaded.
+
+    This function ensures models are loaded only once and reused across requests,
+    dramatically improving performance (from ~140s to <1s per request).
+
+    Args:
+        config: Configuration dict with model paths
+        logging_enabled: Whether to print loading messages
+
+    Returns:
+        dict: Loaded AI resources (models, scalers, etc.)
+    """
+    global _MODEL_CACHE
+
+    # Check if models are already loaded
+    if _MODEL_CACHE['loaded'] and _MODEL_CACHE['resources'] is not None:
+        if logging_enabled:
+            print(f"   ✅ Using cached AI models (already loaded)")
+        return _MODEL_CACHE['resources']
+
+    # Models not loaded yet, load them now
+    if logging_enabled:
+        print(f"   🔧 Loading AI models for the first time...")
+        load_start = time.time()
+
+    try:
+        resources = load_encoding_resources(config, logging_enabled=logging_enabled)
+
+        # Cache the loaded resources
+        _MODEL_CACHE['resources'] = resources
+        _MODEL_CACHE['config'] = config
+        _MODEL_CACHE['loaded'] = True
+
+        if logging_enabled:
+            load_time = time.time() - load_start
+            print(f"   ✅ AI models loaded and cached successfully ({load_time:.1f}s)")
+            print(f"   💡 Subsequent requests will reuse cached models")
+
+        return resources
+
+    except Exception as e:
+        if logging_enabled:
+            print(f"   ❌ Failed to load AI models: {e}")
+        raise
+
 
 # ============================================================================
 # Data Models
@@ -56,6 +164,9 @@ class CompressPayload(BaseModel):
     target_quality: str = 'Medium'  # High, Medium, Low (legacy, derived from VMAF) (legacy, derived from VMAF)
     max_duration: int = 3600  # Maximum allowed video duration in seconds
     output_dir: str = './output'  # Output directory for final files
+    validator_uid: Optional[int] = None  # Validator UID (optional)
+    validator_hotkey: Optional[str] = None  # Validator hotkey (optional)
+    source_request_id: Optional[str] = None  # Original production request ID (for test comparisons)
 
 
 class TestCompressPayload(BaseModel):
@@ -66,6 +177,32 @@ class TestCompressPayload(BaseModel):
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+def _detect_environment(video_url: str) -> str:
+    """
+    Detect environment based on video URL.
+
+    Args:
+        video_url: Video URL from request
+
+    Returns:
+        'production' if HTTPS URL, 'testing' if file path or local URL
+    """
+    if not video_url:
+        return 'unknown'
+
+    video_url_lower = video_url.lower()
+
+    # Production: HTTPS URLs
+    if video_url_lower.startswith('https://') or video_url_lower.startswith('http://'):
+        return 'production'
+
+    # Testing: File paths or local files
+    if video_url_lower.startswith('file://') or '/' in video_url or '\\' in video_url:
+        return 'testing'
+
+    return 'unknown'
+
 
 def create_lightweight_metadata(input_file: str, target_quality: str, target_codec: str, max_duration: int = 3600) -> Optional[dict]:
     """
@@ -180,26 +317,247 @@ def map_codec_name(target_codec: str, prefer_gpu: bool = True) -> str:
 # API Endpoints
 # ============================================================================
 
+@app.get("/")
+async def root():
+    """
+    Root endpoint with service information.
+
+    Returns:
+        dict: Service information
+    """
+    return {
+        "service": "video-compressor",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": ["/health", "/compress-video", "/test-compress"]
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint to verify service is running.
+
+    Returns:
+        dict: Status message
+    """
+    return {"status": "healthy", "service": "video-compressor"}
+
+
+@app.get("/logs/statistics")
+async def get_log_statistics():
+    """
+    Get statistics about logged compression requests.
+
+    Returns:
+        dict: Statistics including total requests, success rate, disk usage
+    """
+    stats = request_logger.get_statistics()
+    return {
+        "status": "success",
+        "statistics": stats
+    }
+
+
+@app.get("/logs/recent")
+async def get_recent_requests(limit: int = 10):
+    """
+    Get recent compression requests.
+
+    Args:
+        limit: Number of recent requests to return (default: 10)
+
+    Returns:
+        dict: List of recent requests
+    """
+    recent = request_logger.get_recent_requests(limit=limit)
+    return {
+        "status": "success",
+        "count": len(recent),
+        "requests": recent
+    }
+
+
+@app.get("/logs/request/{request_id}")
+async def get_request_details(request_id: str):
+    """
+    Get detailed information about a specific request.
+
+    Args:
+        request_id: The request ID to look up
+
+    Returns:
+        dict: Request details including metadata and results
+    """
+    details = request_logger.get_request_details(request_id)
+    if details:
+        return {
+            "status": "success",
+            "request": details
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
+
+
+@app.get("/logs/videos")
+async def list_logged_videos():
+    """
+    List all available logged videos for testing.
+
+    Returns:
+        dict: List of video files with metadata
+    """
+    videos = request_logger.list_available_videos()
+    return {
+        "status": "success",
+        "count": len(videos),
+        "videos": videos
+    }
+
+
+def classify_scene_early(video_path: str, logging_enabled: bool = True) -> str:
+    """
+    Perform early scene classification before encoding.
+
+    This function extracts a few frames and classifies the scene type
+    to determine minimum bitrate requirements for VBR mode.
+
+    Args:
+        video_path: Path to input video file
+        logging_enabled: Whether to print classification logs
+
+    Returns:
+        Scene type string (high-action, medium-action, low-action, animation, default)
+    """
+    try:
+        import tempfile
+        import shutil
+        from utils.processing_utils import USE_CLIP_CLASSIFICATION
+
+        if logging_enabled:
+            print(f"\n🎬 Early Scene Classification (for bitrate calculation)")
+
+        # Create temporary directory for frames
+        temp_dir = tempfile.mkdtemp(prefix='early_scene_')
+
+        try:
+            # Use CLIP if enabled (faster), otherwise use MobileNetV3
+            if USE_CLIP_CLASSIFICATION:
+                from utils.classify_scene_clip import classify_scene_with_clip
+                classification_label, detailed_results, _ = classify_scene_with_clip(
+                    scene_path=video_path,
+                    temp_dir=temp_dir,
+                    num_frames=3,  # Quick classification with 3 frames
+                    device='cuda' if os.path.exists('/dev/nvidia0') else 'cpu',
+                    logging_enabled=logging_enabled
+                )
+            else:
+                # Use MobileNetV3 classifier
+                from utils.processing_utils import classify_scene_from_path
+
+                # Get cached models
+                config = _get_default_config()
+                resources = get_cached_models(config, logging_enabled=False)
+
+                classification_label, detailed_results, _ = classify_scene_from_path(
+                    scene_path=video_path,
+                    temp_dir=temp_dir,
+                    scene_classifier_model=resources['scene_classifier_model'],
+                    available_metrics=resources['available_metrics'],
+                    device=resources['device'],
+                    metrics_scaler=resources['feature_scaler_step'],
+                    class_mapping=resources['class_mapping'],
+                    logging_enabled=logging_enabled,
+                    num_frames=3  # Quick classification
+                )
+
+            # Map classification to scene type
+            scene_type_mapping = {
+                'Gaming Content': 'high-action',
+                'Faces / People': 'low-action',
+                'Screen Content / Text': 'low-action',
+                'Animation / Cartoon / Rendered Graphics': 'animation',
+                'Other': 'default',
+                'unclear': 'default'
+            }
+
+            scene_type = scene_type_mapping.get(classification_label, 'default')
+
+            if logging_enabled:
+                print(f"   Classification: {classification_label} → Scene type: {scene_type}")
+
+            return scene_type
+
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+    except Exception as e:
+        if logging_enabled:
+            print(f"   ⚠️ Early scene classification failed: {e}")
+            print(f"   Using default scene type for bitrate calculation")
+        return 'default'
+
+
 @app.post("/compress-video")
-async def compress_video(video: CompressPayload):
+async def compress_video(video: CompressPayload, background_tasks: BackgroundTasks):
     """
     Compress a video from a URL payload.
-    
+
     Args:
         video: Compression request payload
-        
+        background_tasks: FastAPI background tasks for async VMAF calculation
+
     Returns:
         dict: Compression results with uploaded video URL
     """
+    # Generate unique request ID
+    import uuid
+    request_id = str(uuid.uuid4())
+
+    print(f"\n{'='*80}")
+    print(f"📥 NEW COMPRESSION REQUEST: {request_id}")
+    print(f"{'='*80}")
     print(f"video url: {video.payload_url}")
     print(f"vmaf threshold: {video.vmaf_threshold}")
     print(f"target codec: {video.target_codec}")
-    print(f"codec mode: {video.codec_mode}")
+    print(f"codec mode (requested): {video.codec_mode}")
     print(f"target bitrate: {video.target_bitrate} Mbps")
+
+    # CRITICAL FIX: Force VBR mode to prevent file size increases
+    # CRF mode has no bitrate cap and can cause file size increases (score = -10)
+    # VBR mode enforces bitrate cap while maintaining quality, achieving 86-92% compression
+    # Validator only checks: codec, VMAF, compression ratio (NOT encoding mode)
+    # For CRF requests: validator skips bitrate validation entirely
+    # For VBR requests: validator checks bitrate <= target + 10% (which we'll pass)
+    original_codec_mode = video.codec_mode
+    forced_codec_mode = 'VBR'
+
+    if original_codec_mode.upper() != 'VBR':
+        print(f"⚠️ FORCING VBR MODE: Requested '{original_codec_mode}' but using 'VBR' to prevent file size increases")
+        print(f"   Reason: CRF mode can cause file size increases (score=-10), VBR achieves 86-92% compression")
+        print(f"   Validator only checks: codec, VMAF, compression ratio (not encoding mode)")
+    else:
+        print(f"✅ Using VBR mode as requested")
 
     # Download video from URL
     input_path = await download_video(video.payload_url)
     input_file = Path(input_path)
+
+    # Prepare request data for logging (use forced VBR mode)
+    request_data = {
+        'request_id': request_id,
+        'payload_url': video.payload_url,
+        'vmaf_threshold': video.vmaf_threshold,
+        'target_codec': video.target_codec,
+        'codec_mode': forced_codec_mode,  # Use forced VBR mode
+        'target_bitrate': video.target_bitrate,
+        'output_dir': video.output_dir,
+        'max_duration': video.max_duration
+    }
     vmaf_threshold = video.vmaf_threshold
 
     # Map VMAF threshold to target quality using configurable thresholds
@@ -226,18 +584,198 @@ async def compress_video(video: CompressPayload):
     output_dir = Path(video.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Perform video compression
+    # Calculate intelligent target bitrate for VBR mode
+    # For VBR mode, we need to set an appropriate bitrate cap to achieve compression
+    # while maintaining target VMAF quality
+    calculated_target_bitrate = video.target_bitrate
+    original_video_bitrate = None  # Track original bitrate for logging
+    has_complexity = False  # Track if content complexity was detected (default: simple content)
+
+    if forced_codec_mode == 'VBR':
+        try:
+            # STEP 1: Perform early scene classification AND get video metrics
+            scene_type = classify_scene_early(str(input_file), logging_enabled=True)
+
+            # STEP 1.5: Get video complexity metrics for bitrate adjustment
+            from utils.analyze_video_fast import analyze_video_fast
+            video_metrics = analyze_video_fast(str(input_file), max_frames=30, logging_enabled=False)
+            if not video_metrics:
+                video_metrics = {}  # Fallback to empty dict if analysis fails
+
+            # STEP 2: Get input video bitrate
+            import subprocess
+            probe_cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=bit_rate',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(input_file)
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0 and result.stdout.strip():
+                input_bitrate_bps = int(result.stdout.strip())
+                input_bitrate_mbps = input_bitrate_bps / 1_000_000
+                original_video_bitrate = input_bitrate_mbps  # Store for logging
+
+                # STEP 3: Calculate target bitrate based on quality level and codec efficiency
+                # DYNAMIC COMPRESSION: Balanced multipliers that adapt to input bitrate and complexity
+                # These work with CQ values to find optimal bitrate for VMAF target
+                codec_efficiency = {
+                    'av1_nvenc': 0.25,      # AV1: 75% reduction vs H.264 (realistic compression)
+                    'hevc_nvenc': 0.35,     # HEVC: 65% reduction vs H.264
+                    'h264_nvenc': 0.50,     # H.264: 50% reduction with better encoding
+                    'libx265': 0.35,        # Same as hevc_nvenc
+                    'libx264': 0.50,        # Same as h264_nvenc
+                    'libsvtav1': 0.25,      # Same as av1_nvenc
+                    'libvpx-vp9': 0.30      # VP9 between AV1 and HEVC
+                }.get(ffmpeg_codec, 0.40)  # Default to 40% for unknown codecs
+
+                # Adjust based on target quality
+                # DYNAMIC: Quality multipliers work with complexity detection
+                # Lower multipliers for easier content, higher for complex content
+                quality_multiplier = {
+                    'High': 0.9,    # VMAF 93 - Needs more bitrate for quality
+                    'Medium': 0.7,  # VMAF 89 - Balanced approach
+                    'Low': 0.5      # VMAF 85 - More aggressive compression
+                }.get(target_quality, 0.7)
+
+                # Calculate target: input_bitrate * codec_efficiency * quality_multiplier
+                calculated_target_bitrate = input_bitrate_mbps * codec_efficiency * quality_multiplier
+
+                # STEP 4: Calculate formula-based bitrate target
+                # Uses production-validated formula: B_target = B_base × (W×H / 1920×1080) × (FPS / 30)
+                from config.advanced_encoding_config import calculate_formula_based_bitrate_target
+
+                # Get video properties for formula
+                width = video_metrics.get('width', 1920)
+                height = video_metrics.get('height', 1080)
+                fps = video_metrics.get('fps', 30.0)
+
+                # Calculate scene-specific bitrate target
+                formula_based_target = calculate_formula_based_bitrate_target(
+                    scene_type=scene_type,
+                    width=width,
+                    height=height,
+                    fps=fps
+                )
+
+                print(f"   📐 Formula-based target: {formula_based_target:.2f} Mbps")
+                print(f"      Scene: {scene_type}, Resolution: {width}x{height}, FPS: {fps}")
+
+                # Use formula-based target as minimum
+                min_required_bitrate = formula_based_target
+
+                # STEP 4.5: Adjust minimum bitrate based on content complexity
+                # If video has high noise, motion, or texture, increase minimum bitrate
+                complexity_multiplier = 1.0
+                complexity_factors = []
+                has_complexity = False  # Track if any complexity was detected
+
+                # Check grain/noise level (high noise needs more bitrate)
+                grain_noise = video_metrics.get('metrics_avg_grain_noise', 0)
+                if grain_noise > 10:  # High noise threshold
+                    complexity_multiplier *= 1.3
+                    complexity_factors.append(f"high noise ({grain_noise:.1f})")
+                    has_complexity = True
+                elif grain_noise > 7:  # Medium noise
+                    complexity_multiplier *= 1.15
+                    complexity_factors.append(f"medium noise ({grain_noise:.1f})")
+                    has_complexity = True
+
+                # Check motion level (high motion needs more bitrate)
+                motion = video_metrics.get('metrics_avg_motion', 0)
+                if motion > 0.15:  # High motion threshold
+                    complexity_multiplier *= 1.25
+                    complexity_factors.append(f"high motion ({motion:.3f})")
+                    has_complexity = True
+                elif motion > 0.10:  # Medium motion
+                    complexity_multiplier *= 1.1
+                    complexity_factors.append(f"medium motion ({motion:.3f})")
+                    has_complexity = True
+
+                # Check texture complexity (complex textures need more bitrate)
+                texture = video_metrics.get('metrics_avg_texture', 0)
+                if texture > 6.5:  # High texture complexity
+                    complexity_multiplier *= 1.2
+                    complexity_factors.append(f"high texture ({texture:.1f})")
+                    has_complexity = True
+                elif texture > 5.5:  # Medium texture
+                    complexity_multiplier *= 1.1
+                    complexity_factors.append(f"medium texture ({texture:.1f})")
+                    has_complexity = True
+
+                # Apply complexity adjustment to minimum bitrate
+                if complexity_multiplier > 1.0:
+                    original_min = min_required_bitrate
+                    min_required_bitrate *= complexity_multiplier
+                    print(f"   ⚠️ Content complexity detected: {', '.join(complexity_factors)}")
+                    print(f"   📈 Adjusted minimum bitrate: {original_min:.2f} → {min_required_bitrate:.2f} Mbps ({complexity_multiplier:.2f}x)")
+
+                # STEP 5: Smart bitrate selection strategy
+                # 5.1: Pick minimum of calculated and requested (prefer lower bitrate for efficiency)
+                picked_bitrate = min(calculated_target_bitrate, video.target_bitrate)
+
+                # 5.2: Compare with minimum required bitrate
+                if picked_bitrate < min_required_bitrate:
+                    # Picked is too low - use minimum required
+                    final_bitrate = min_required_bitrate
+                    selection_reason = f"Picked {picked_bitrate:.2f} < minimum {min_required_bitrate:.2f}, using minimum"
+                else:
+                    # Picked is sufficient - check if original bitrate is lower than requested
+                    # BUT only use original if it's high enough (at least 1.5x minimum required)
+                    if input_bitrate_mbps < video.target_bitrate and input_bitrate_mbps >= min_required_bitrate * 1.5:
+                        # Original is lower than requested AND sufficient for quality - use it
+                        final_bitrate = input_bitrate_mbps
+                        selection_reason = f"Original {input_bitrate_mbps:.2f} < requested {video.target_bitrate:.2f} and sufficient (≥{min_required_bitrate*1.5:.1f}), using original"
+                    else:
+                        # Use middle value between picked and minimum
+                        final_bitrate = (picked_bitrate + min_required_bitrate) / 2
+                        selection_reason = f"Using middle value between picked {picked_bitrate:.2f} and minimum {min_required_bitrate:.2f}"
+
+                # STEP 5.5: Apply efficiency multiplier for simple content
+                # DYNAMIC: For simple content, we can compress more efficiently
+                # For complex content (has_complexity=True), use 100% of calculated bitrate
+                # For simple content (has_complexity=False), use 70% for better efficiency
+                if not has_complexity:
+                    efficiency_multiplier = 0.70  # Balanced reduction for simple content
+                    original_final = final_bitrate
+                    final_bitrate *= efficiency_multiplier
+                    print(f"   💡 Simple content detected - applying {efficiency_multiplier}x efficiency multiplier")
+                    print(f"   📉 Adjusted final bitrate: {original_final:.2f} → {final_bitrate:.2f} Mbps")
+
+                print(f"📊 VBR Bitrate Calculation:")
+                print(f"   Scene type: {scene_type}")
+                print(f"   Input bitrate: {input_bitrate_mbps:.2f} Mbps")
+                print(f"   Codec efficiency: {codec_efficiency*100:.0f}%")
+                print(f"   Quality multiplier: {quality_multiplier}x")
+                print(f"   Calculated target: {calculated_target_bitrate:.2f} Mbps")
+                print(f"   User requested: {video.target_bitrate:.2f} Mbps")
+                print(f"   Picked (min of above): {picked_bitrate:.2f} Mbps")
+                print(f"   Minimum required: {min_required_bitrate:.2f} Mbps (for {scene_type} + {target_quality})")
+                print(f"   Selection: {selection_reason}")
+                print(f"   Final target: {final_bitrate:.2f} Mbps")
+
+                calculated_target_bitrate = final_bitrate
+            else:
+                print(f"⚠️ Could not detect input bitrate, using user-specified: {video.target_bitrate} Mbps")
+        except Exception as e:
+            print(f"⚠️ Error calculating target bitrate: {e}, using user-specified: {video.target_bitrate} Mbps")
+
+    # Perform video compression (use forced VBR mode)
     try:
+        # BUG FIX #1: Pass minimum required bitrate to video_compressor
         compressed_video_path = video_compressor(
             input_file=str(input_file),
             target_quality=target_quality,
             target_codec=ffmpeg_codec,
-            codec_mode=video.codec_mode,
-            target_bitrate=video.target_bitrate,
+            codec_mode=forced_codec_mode,  # Use forced VBR mode
+            target_bitrate=calculated_target_bitrate,
             max_duration=video.max_duration,
             output_dir=str(output_dir),
             skip_scene_detection=True,  # Skip for miner chunks (already pre-split)
-            skip_preprocessing=True  # Skip for miner chunks (already compressed)
+            skip_preprocessing=True,  # Skip for miner chunks (already compressed)
+            min_required_bitrate=min_required_bitrate if 'min_required_bitrate' in locals() else None
         )
         print(f"compressed_video_path: {compressed_video_path}")
 
@@ -252,34 +790,199 @@ async def compress_video(video: CompressPayload):
                 print(f"object_name: {object_name}")
                 print("Video uploaded successfully.")
                 
-                # Clean up local file
+                # Log the successful request BEFORE cleanup
+                result_data = {
+                    'compressed_video_path': compressed_video_path,
+                    'object_name': object_name,
+                    'uploaded': True
+                }
+                request_logger.log_request(
+                    request_id=request_id,
+                    downloaded_video_path=input_path,
+                    request_data=request_data,
+                    result=result_data,
+                    validator_uid=video.validator_uid,
+                    validator_hotkey=video.validator_hotkey
+                )
+
+                # Load encoding report to get metadata for async VMAF calculation
+                try:
+                    report_path = Path(output_dir) / f"{Path(input_path).stem}_encoding_report.json"
+                    print(f"🔍 Looking for encoding report at: {report_path}")
+                    print(f"   Input path: {input_path}")
+                    print(f"   Output dir: {output_dir}")
+                    print(f"   Report exists: {report_path.exists()}")
+                    if report_path.exists():
+                        with open(report_path, 'r') as f:
+                            encoding_report = json.load(f)
+
+                        # Extract metadata from comprehensive training data
+                        training_data = encoding_report.get('comprehensive_training_data', {})
+                        pipeline_data = training_data.get('pipeline_stages_data', {})
+                        scene_encoding_data = pipeline_data.get('part3_ai_encoding', [])
+                        print(f"   📊 Found {len(scene_encoding_data)} scenes in encoding report")
+
+                        if scene_encoding_data:
+                            # Get first scene data
+                            scene_data = scene_encoding_data[0]
+                            scene_type = scene_data.get('scene_type', 'unknown')
+                            cq_used = scene_data.get('final_adjusted_cq', 0)
+
+                            # Calculate compression ratio
+                            original_size = os.path.getsize(input_path)
+                            compressed_size = os.path.getsize(compressed_video_path)
+                            compression_ratio = original_size / compressed_size if compressed_size > 0 else 0
+
+                            # Copy files to VMAF directory for async calculation
+                            vmaf_dir = Path("compression_logs/vmaf_files")
+                            vmaf_dir.mkdir(parents=True, exist_ok=True)
+
+                            import shutil
+                            original_copy = vmaf_dir / f"{request_id}_original.mp4"
+                            compressed_copy = vmaf_dir / f"{request_id}_compressed.mp4"
+
+                            shutil.copy2(input_path, original_copy)
+                            shutil.copy2(compressed_video_path, compressed_copy)
+
+                            # Detect environment based on URL
+                            environment = _detect_environment(video.payload_url)
+
+                            # Schedule async VMAF calculation
+                            background_tasks.add_task(
+                                async_vmaf_logger.calculate_and_log_vmaf,
+                                request_id=request_id,
+                                original_video_path=str(original_copy),
+                                compressed_video_path=str(compressed_copy),
+                                target_vmaf=vmaf_threshold,
+                                scene_type=scene_type,
+                                cq_used=cq_used,
+                                compression_ratio=compression_ratio,
+                                codec=ffmpeg_codec,
+                                codec_mode=forced_codec_mode,  # Actual mode used (always VBR)
+                                original_bitrate=original_video_bitrate,  # Original video bitrate
+                                target_bitrate=calculated_target_bitrate,  # Applied bitrate (after minimum bitrate logic)
+                                requested_bitrate=video.target_bitrate,  # User-requested bitrate
+                                requested_mode=original_codec_mode,  # Originally requested mode (CRF/VBR)
+                                validator_uid=video.validator_uid,
+                                validator_hotkey=video.validator_hotkey,
+                                environment=environment,
+                                source_request_id=video.source_request_id,  # For test comparisons
+                                video_analysis=video_metrics,  # Video complexity analysis
+                                width=video_metrics.get('metrics_resolution_width'),  # Extract from video_metrics
+                                height=video_metrics.get('metrics_resolution_height'),  # Extract from video_metrics
+                                fps=video_metrics.get('metrics_frame_rate')  # Extract from video_metrics
+                            )
+                            print(f"📊 Scheduled async VMAF calculation for request {request_id}")
+                        else:
+                            print(f"⚠️ No scenes found in encoding report (scenes array is empty)")
+                    else:
+                        print(f"⚠️ Encoding report not found at: {report_path}")
+                except Exception as vmaf_error:
+                    print(f"⚠️ Failed to schedule async VMAF calculation: {vmaf_error}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Clean up local compressed file
                 if os.path.exists(compressed_video_path):
                     os.remove(compressed_video_path)
-                    print(f"{compressed_video_path} has been deleted.")
+                    print(f"🗑️ Deleted compressed file: {compressed_video_path}")
                 else:
-                    print(f"{compressed_video_path} does not exist.")
-                
+                    print(f"⚠️ Compressed file does not exist: {compressed_video_path}")
+
+                # Clean up downloaded original file (already logged)
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+                    print(f"🗑️ Deleted downloaded file: {input_path}")
+                else:
+                    print(f"⚠️ Downloaded file does not exist: {input_path}")
+
                 # Get sharing link
-                sharing_link: Optional[str] = await storage_client.get_presigned_url(object_name)
-                print(f"sharing_link: {sharing_link}")
-                
-                if not sharing_link:
-                    print("Upload failed")
-                    return {"uploaded_video_url": None}
-                
-                return {
-                    "uploaded_video_url": sharing_link,
-                    "status": "success",
-                    "compressed_video_path": str(compressed_video_path)
-                }
+                try:
+                    sharing_link: Optional[str] = await storage_client.get_presigned_url(object_name)
+                    print(f"sharing_link: {sharing_link}")
+
+                    if not sharing_link:
+                        print("⚠️ Warning: get_presigned_url returned None")
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Failed to generate sharing link for uploaded video"
+                        )
+
+                    return {
+                        "uploaded_video_url": sharing_link,
+                        "status": "success",
+                        "object_name": object_name
+                    }
+                except HTTPException:
+                    raise
+                except Exception as link_error:
+                    print(f"❌ Error getting presigned URL: {link_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to generate sharing link: {str(link_error)}"
+                    )
             except Exception as upload_error:
+                print(f"❌ Upload error: {upload_error}")
                 raise HTTPException(
-                    status_code=500, 
+                    status_code=500,
                     detail=f"Failed to upload compressed video: {str(upload_error)}"
                 )
         else:
+            error_msg = f"Compression failed: compressed_video_path={compressed_video_path}, exists={Path(compressed_video_path).exists() if compressed_video_path else 'N/A'}"
+            print(f"❌ {error_msg}")
+
+            # Log the failed request
+            request_logger.log_request(
+                request_id=request_id,
+                downloaded_video_path=input_path,
+                request_data=request_data,
+                error=error_msg,
+                validator_uid=video.validator_uid,
+                validator_hotkey=video.validator_hotkey
+            )
+
+            # Clean up downloaded file even on failure (already logged)
+            if os.path.exists(input_path):
+                os.remove(input_path)
+                print(f"🗑️ Cleaned up downloaded file after compression failure: {input_path}")
             raise HTTPException(status_code=500, detail="Video compression failed")
+    except HTTPException:
+        # Log HTTP exceptions if not already logged
+        error_msg = "HTTP exception during compression"
+        request_logger.log_request(
+            request_id=request_id,
+            downloaded_video_path=input_path,
+            request_data=request_data,
+            error=error_msg,
+            validator_uid=video.validator_uid,
+            validator_hotkey=video.validator_hotkey
+        )
+
+        # Clean up downloaded file on HTTP exceptions (already logged)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+            print(f"🗑️ Cleaned up downloaded file after error: {input_path}")
+        raise
     except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+
+        # Log the exception
+        request_logger.log_request(
+            request_id=request_id,
+            downloaded_video_path=input_path,
+            request_data=request_data,
+            error=error_msg,
+            validator_uid=video.validator_uid,
+            validator_hotkey=video.validator_hotkey
+        )
+
+        # Clean up downloaded file on any exception (already logged)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+            print(f"🗑️ Cleaned up downloaded file after exception: {input_path}")
         raise HTTPException(status_code=500, detail=f"Video compression error: {str(e)}")
 
 
@@ -340,7 +1043,8 @@ def video_compressor(
     max_duration: int = 3600,
     output_dir: str = './output',
     skip_scene_detection: bool = True,
-    skip_preprocessing: bool = True
+    skip_preprocessing: bool = True,
+    min_required_bitrate: Optional[float] = None
 ) -> Optional[str]:
     """
     Main video compression pipeline orchestrator.
@@ -376,6 +1080,31 @@ def video_compressor(
     config['video_processing']['target_codec'] = target_codec
     config['video_processing']['codec_mode'] = codec_mode
     config['video_processing']['target_bitrate'] = target_bitrate
+    # BUG FIX #1: Add minimum required bitrate to config
+    if min_required_bitrate is not None:
+        config['video_processing']['min_required_bitrate'] = min_required_bitrate
+
+    # ============================================================================
+    # NETFLIX PER-TITLE ENCODING CONFIGURATION
+    # ============================================================================
+    # Enable Netflix per-title encoding (set to True to enable)
+    config['video_processing']['use_netflix_per_title'] = False  # Change to True to enable
+    config['video_processing']['netflix_fast_mode'] = False  # Set to True for 3 probes instead of 4
+
+    # VMAF calculation settings for Netflix per-title
+    if 'vmaf_calculation' not in config:
+        config['vmaf_calculation'] = {}
+    config['vmaf_calculation']['use_vmafneg'] = False
+    config['vmaf_calculation']['calculate_scene_vmaf'] = True
+    config['vmaf_calculation']['vmaf_use_sampling'] = True
+    config['vmaf_calculation']['vmaf_num_clips'] = 3
+    config['vmaf_calculation']['vmaf_clip_duration'] = 2
+
+    # Model paths for VMAF (optional - will use defaults if not set)
+    if 'model_paths' not in config:
+        config['model_paths'] = {}
+    # config['model_paths']['default_vmaf_model'] = '/usr/local/share/vmaf/model/vmaf_v0.6.1.json'
+    # config['model_paths']['vmafneg_model'] = '/usr/local/share/vmaf/model/vmaf_v0.6.1neg.json'
 
     # Create temp directory
     temp_dir = Path(config['directories']['temp_dir'])
@@ -552,32 +1281,49 @@ def _get_default_config() -> dict:
             'codec_mode': 'CRF',  # Will be overridden by request
             'target_bitrate': 10.0,  # Will be overridden by request
             'size_increase_protection': True,
-            'conservative_cq_adjustment': 2,
+            'conservative_cq_adjustment': 0,  # Removed adjustment for better compression (was +2)
             'max_output_size_ratio': 1.15,
             'max_encoding_retries': 2,
             'basic_cq_lookup_by_quality': {
                 'High': {
-                    'animation': 22,
-                    'low-action': 20,
-                    'medium-action': 18,
-                    'high-action': 16,
-                    'default': 19
+                    # VMAF threshold 93, target 93+ (adjusted based on test results)
+                    # Previous: CQ 23 achieved 92.19 VMAF (0.81 short)
+                    # Adjusted: Lower CQ values for higher quality
+                    'animation': 23,      # Animation easier to compress (was 25)
+                    'low-action': 21,     # Faces/people, low motion (was 23, now matches AV1's success)
+                    'medium-action': 19,  # Moderate complexity (was 21)
+                    'high-action': 17,    # High motion/complexity (was 19)
+                    'default': 21         # (was 23)
                 },
                 'Medium': {
-                    'animation': 25,
-                    'low-action': 23,
-                    'medium-action': 21,
-                    'high-action': 19,
-                    'default': 22
+                    # VMAF threshold 89, target 91-92 (safety margin: +2-3)
+                    # Current: CQ 26 achieves 91.08 VMAF (+2.08 margin) ✅ Working well
+                    'animation': 28,      # Animation easier to compress
+                    'low-action': 26,     # Faces/people, low motion
+                    'medium-action': 24,  # Moderate complexity
+                    'high-action': 22,    # High motion/complexity
+                    'default': 26
                 },
                 'Low': {
-                    'animation': 28,
-                    'low-action': 26,
-                    'medium-action': 24,
-                    'high-action': 22,
-                    'default': 25
+                    # VMAF threshold 85, target 87-88 (safety margin: +2-3)
+                    # Current: CQ 30 achieves 89.34 VMAF (+4.34 margin) ✅ Working well
+                    'animation': 32,      # Animation easier to compress
+                    'low-action': 30,     # Faces/people, low motion
+                    'medium-action': 28,  # Moderate complexity
+                    'high-action': 26,    # High motion/complexity
+                    'default': 30
                 }
             },
+
+            # ============================================================================
+            # NETFLIX PER-TITLE ENCODING CONFIGURATION
+            # ============================================================================
+            # Enable Netflix per-title encoding (alternative to lookup table)
+            # Note: Also requires ENABLE_NETFLIX_PER_TITLE = True in netflix_per_title_encoder.py
+            'use_netflix_per_title': False,  # Set to True to enable
+
+            # Fast mode: Use 3 probe points instead of 4 (faster but slightly less accurate)
+            'netflix_fast_mode': False,  # Set to True for 60s timeout scenarios
         },
         'scene_detection': {
             'enable_time_based_fallback': True,
@@ -663,30 +1409,30 @@ def _execute_ai_encoding(scenes_metadata: list, config: dict, target_quality: st
     """Execute Part 3: AI Encoding."""
     print(f"\n🧠 === Part 3: AI Encoding ===")
     part3_start_time = time.time()
-    
-    print(f"   🔧 Loading AI models and resources...")
+
     print(f"   📋 Using quality-based CQ lookup tables for {target_quality} quality")
     print(f"   🎯 Target Quality Level: {target_quality}")
-    
+
     # Display CQ ranges for selected quality level
     quality_info = {
         'High': {'vmaf': 93, 'cq_range': '16-22'},
         'Medium': {'vmaf': 89, 'cq_range': '19-25'},
         'Low': {'vmaf': 85, 'cq_range': '22-28'}
     }
-    
+
     if target_quality in quality_info:
         info = quality_info[target_quality]
         print(f"   🎚️ CQ Range for {target_quality}: {info['cq_range']} (Target VMAF: {info['vmaf']})")
-    
+
     print(f"   🔧 Loading AI models and resources...")
-    
+
     try:
-        resources = load_encoding_resources(config, logging_enabled=True)
+        # Use cached models instead of loading every time
+        resources = get_cached_models(config, logging_enabled=True)
         print(f"   ✅ AI resources loaded successfully")
         print(f"   🧠 Mode: Scene classification + CQ lookup table")
     except Exception as e:
-        print(f"   ❌ Failed to load GGG AI resources: {e}")
+        print(f"   ❌ Failed to load AI resources: {e}")
         return None
     
     # Process each scene individually

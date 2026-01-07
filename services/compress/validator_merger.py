@@ -262,10 +262,10 @@ def validation_and_merging(original_video_path, encoded_scenes_data, config, log
     overall_compression_ratio = ((input_size_total - output_size_total) / input_size_total * 100) if input_size_total > 0 else 0
 
     # Calculate VMAF statistics
-    scenes_with_valid_vmaf = [s for s in successful_scenes if s.get('actual_vmaf') is not None]
-    average_scene_vmaf = sum(s['actual_vmaf'] for s in scenes_with_valid_vmaf) / len(scenes_with_valid_vmaf) if scenes_with_valid_vmaf else 0
+    scenes_with_valid_vmaf = [s for s in successful_scenes if s.get('actual_vmaf') is not None and s.get('actual_vmaf', 0) > 0]
+    average_scene_vmaf = sum(s.get('actual_vmaf', 0) for s in scenes_with_valid_vmaf) / len(scenes_with_valid_vmaf) if scenes_with_valid_vmaf else 0
     target_vmaf = config.get('video_processing', {}).get('target_vmaf', 93.0)
-    scenes_meeting_target = sum(1 for s in scenes_with_valid_vmaf if s['actual_vmaf'] >= target_vmaf)
+    scenes_meeting_target = sum(1 for s in scenes_with_valid_vmaf if s.get('actual_vmaf', 0) >= target_vmaf)
 
     # ✅ SIMPLE: Extract training data directly from scenes
     def extract_training_data_from_scenes(scenes_data):

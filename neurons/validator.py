@@ -71,8 +71,8 @@ class Validator(base.BaseValidator):
         
         self.challenge_synthesizer = validating.synthesizing.Synthesizer()
         logger.info("💧 Initialized challenge synthesizer 💧")
-        
-        self.dendrite = bt.dendrite(wallet=self.wallet)
+
+        self.dendrite = bt.Dendrite(wallet=self.wallet)
         logger.info("💧 Initialized dendrite 💧")
         
         self.score_client = httpx.AsyncClient(

@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import torch
-import pickle 
+import pickle
 import traceback
 import subprocess
 from sklearn.exceptions import NotFittedError
@@ -10,10 +10,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 from utils.processing_utils import (
     encode_scene_with_size_check,
-    classify_scene_from_path 
+    classify_scene_from_path
 )
 from utils.encode_video import encode_video
 from utils.classify_scene import load_scene_classifier_model, CombinedModel
+from netflix_per_title_encoder import should_use_netflix_per_title, netflix_per_title_encoding
 
 def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_quality_level=None):
     """
@@ -63,27 +64,27 @@ def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_qualit
     default_cq_map = {
         # High quality tier (lower CQ = higher quality)
         'high': {
-            'animation': 25,      # Cartoons compress well naturally
-            'low-action': 23,     # Text/faces need moderate CQ for clarity
-            'medium-action': 21,  # Balanced CQ for general content
-            'high-action': 19,    # Gaming/sports need lower CQ for quality
-            'default': 22         # Safe middle-ground when unsure
+            'animation': 28,      # VMAF 93 target - cartoons compress well
+            'low-action': 26,     # VMAF 93 target - faces/people need clarity
+            'medium-action': 24,  # VMAF 93 target - balanced content
+            'high-action': 22,    # VMAF 93 target - high motion needs quality
+            'default': 25         # VMAF 93 target - safe middle-ground
         },
         # Medium quality tier (balanced CQ)
         'medium': {
-            'animation': 28,      # Cartoons compress well, can use higher CQ
-            'low-action': 26,     # Text/faces need moderate CQ for clarity
-            'medium-action': 24,  # Balanced CQ for general content
-            'high-action': 22,    # Gaming/sports need lower CQ for quality
-            'default': 25         # Safe middle-ground when unsure
+            'animation': 31,      # VMAF 89 target - cartoons compress well
+            'low-action': 29,     # VMAF 89 target - faces/people (reduced from 33)
+            'medium-action': 27,  # VMAF 89 target - balanced content
+            'high-action': 25,    # VMAF 89 target - high motion needs quality
+            'default': 28         # VMAF 89 target - safe middle-ground
         },
-        # Low quality tier (higher CQ = smaller files)
+        # Low quality tier (higher CQ = smaller files) - Optimized for compression
         'low': {
-            'animation': 31,      # Cartoons compress well, can use higher CQ
-            'low-action': 29,     # Text/faces need moderate CQ for clarity
-            'medium-action': 27,  # Balanced CQ for general content
-            'high-action': 25,    # Gaming/sports need lower CQ for quality
-            'default': 28         # Safe middle-ground when unsure
+            'animation': 34,      # VMAF 85 target - aggressive compression
+            'low-action': 32,     # VMAF 85 target - aggressive compression
+            'medium-action': 30,  # VMAF 85 target - aggressive compression
+            'high-action': 28,    # VMAF 85 target - aggressive compression
+            'default': 31         # VMAF 85 target - aggressive compression
         }
     }
     
@@ -217,7 +218,33 @@ def get_scalers_from_pipeline(pipeline_path='services/compress/models/preprocess
                     except ImportError as e:
                         if actual_verbose:
                             print(f"   ❌ Failed to import from utils: {e}")
-                
+
+                # Handle services.compress.utils.data_preprocessing module context (from training)
+                elif module == 'services.compress.utils.data_preprocessing':
+                    if actual_verbose:
+                        print(f"   🔧 Handling services.compress.utils.data_preprocessing context for class: {name}")
+                    try:
+                        from utils import ColumnDropper, VMAFScaler, TargetExtractor, CQScaler, ResolutionTransformer, FeatureScaler, FrameRateTransformer
+                        class_map = {
+                            'ColumnDropper': ColumnDropper,
+                            'VMAFScaler': VMAFScaler,
+                            'TargetExtractor': TargetExtractor,
+                            'CQScaler': CQScaler,
+                            'ResolutionTransformer': ResolutionTransformer,
+                            'FeatureScaler': FeatureScaler,
+                            'FrameRateTransformer': FrameRateTransformer
+                        }
+                        if name in class_map:
+                            if actual_verbose:
+                                print(f"   ✅ Found {name} in utils module (remapped from services.compress.utils)")
+                            return class_map[name]
+                        else:
+                            if actual_verbose:
+                                print(f"   ❌ Class {name} not found in utils module")
+                    except ImportError as e:
+                        if actual_verbose:
+                            print(f"   ❌ Failed to import from utils: {e}")
+
                 # For other modules, use the default behavior
                 if actual_verbose:
                     print(f"   🔧 Using default unpickler for {module}.{name}")
@@ -431,34 +458,82 @@ def get_scalers_from_pipeline(pipeline_path='services/compress/models/preprocess
 
 def load_encoding_resources(config, logging_enabled=True):
     """
-    
+
     1. Scene classifier AI model - to identify content type (animation, gaming, etc.)
     2. Preprocessing pipeline - to prepare video frames for the AI model
     3. GPU/CPU device selection - for running the AI inference
-    
-    
+
+
     Args:
         config (dict): Configuration containing model file paths
         logging_enabled (bool): Whether to print loading status messages
-        
+
     Returns:
         tuple: (scene_model, preprocessing_pipeline, device) ready for encoding
     """
+    # Check if CLIP is enabled
+    from utils.processing_utils import USE_CLIP_CLASSIFICATION
+
     # Get model file paths from config
     model_paths = config.get('model_paths', {})
     scene_model_path = model_paths.get('scene_classifier_model', "services/compress/models/scene_classifier_model.pth")
     preprocessing_pipeline_path = model_paths.get('preprocessing_pipeline', "services/compress/models/preprocessing_pipeline.pkl")
-    
+
     # Choose GPU if available, otherwise use CPU
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Load scene classifier AI model
-    model_state_dict, available_metrics, class_mapping = load_scene_classifier_model(scene_model_path, device, logging_enabled)
-    print(f"   ✅ Scene classifier model loaded from {scene_model_path} on {device}")
-    scene_classifier_model = CombinedModel(num_classes=len(class_mapping), metrics_dim=len(available_metrics))
-    scene_classifier_model.load_state_dict(model_state_dict)
-    scene_classifier_model.to(device)
-    scene_classifier_model.eval()
+    # Skip loading old scene classifier model if CLIP is enabled
+    if USE_CLIP_CLASSIFICATION:
+        if logging_enabled:
+            print(f"   ⚡ CLIP classification enabled - skipping MobileNetV3 model load")
+            print(f"   💡 Using CLIP for scene classification (faster, no model file needed)")
+
+        scene_classifier_model = None
+        available_metrics = []
+        class_mapping = {}
+        image_size = 384
+        confidence_threshold = 0.5  # Default confidence threshold for CLIP
+        model_type = None
+    else:
+        # Resolve absolute path and validate file exists
+        scene_model_path_abs = os.path.abspath(scene_model_path)
+        if not os.path.exists(scene_model_path_abs):
+            error_msg = f"❌ ERROR: Scene classifier model not found at: {scene_model_path_abs}"
+            if logging_enabled:
+                print(error_msg)
+                # Check if alternative file exists
+                alt_path = os.path.abspath("services/compress/models/scene_classifier_model_1.pth")
+                if os.path.exists(alt_path):
+                    print(f"   💡 Found alternative model at: {alt_path}")
+                    print(f"   💡 Consider updating config or renaming file to: scene_classifier_model.pth")
+            raise FileNotFoundError(error_msg)
+
+        if logging_enabled:
+            print(f"   📂 Loading scene classifier model from: {scene_model_path_abs}")
+            file_size_mb = os.path.getsize(scene_model_path_abs) / (1024 * 1024)
+            print(f"   📊 Model file size: {file_size_mb:.2f} MB")
+
+        # Load scene classifier AI model
+        model_state_dict, available_metrics, class_mapping, image_size, confidence_threshold, model_type = load_scene_classifier_model(scene_model_path_abs, device, logging_enabled)
+        print(f"   ✅ Scene classifier model loaded from {scene_model_path_abs} on {device}")
+        # Use model_type from the loaded checkpoint (already extracted in load_scene_classifier_model)
+        scene_classifier_model = CombinedModel(
+            num_classes=len(class_mapping),
+            metrics_dim=len(available_metrics),
+            model_type=model_type,
+            use_pretrained=False  # Don't use pretrained weights when loading from checkpoint
+        )
+        # Load state dict with strict=False to handle minor architecture differences
+        try:
+            scene_classifier_model.load_state_dict(model_state_dict, strict=True)
+        except RuntimeError as e:
+            if logging_enabled:
+                print(f"   ⚠️ Warning: Strict loading failed, trying with strict=False...")
+            scene_classifier_model.load_state_dict(model_state_dict, strict=False)
+            if logging_enabled:
+                print(f"   ⚠️ Model loaded with strict=False - some weights may not match")
+        scene_classifier_model.to(device)
+        scene_classifier_model.eval()
     
     pipeline_obj, feature_scaler_step, vmaf_scaler, cq_min, cq_max = get_scalers_from_pipeline(preprocessing_pipeline_path, verbose=logging_enabled, logging_enabled=logging_enabled)
     print(f"   ✅ Preprocessing pipeline loaded from {preprocessing_pipeline_path}")
@@ -468,6 +543,8 @@ def load_encoding_resources(config, logging_enabled=True):
         "available_metrics": available_metrics,           
         "device": device,                                 
         "class_mapping": class_mapping,                   
+        "image_size": image_size,  # Add image size to resources
+        "confidence_threshold": confidence_threshold,  # Add confidence threshold
         "pipeline_obj": pipeline_obj,                     
         "feature_scaler_step": feature_scaler_step,       
         "vmaf_scaler": vmaf_scaler,                       
@@ -605,6 +682,20 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
         if logging_enabled:
             print(f"   ⚡ Using fallback codec mapping: {current_codec} → {codec}")
 
+    # Ensure codec is mapped to actual encoder name (e.g., 'av1' -> 'av1_nvenc')
+    # Map standard codec names to actual FFmpeg encoder names
+    codec_name_map = {
+        'av1': 'av1_nvenc' if torch.cuda.is_available() else 'libsvtav1',
+        'hevc': 'hevc_nvenc' if torch.cuda.is_available() else 'libx265',
+        'h264': 'h264_nvenc' if torch.cuda.is_available() else 'libx264',
+        'vp9': 'libvpx-vp9'
+    }
+    # If codec is a standard name, map it to the actual encoder
+    if codec.lower() in codec_name_map:
+        codec = codec_name_map[codec.lower()]
+        if logging_enabled:
+            print(f"   🔄 Mapped codec name to encoder: {codec}")
+
     if logging_enabled:
         print(f"   🎥 Final Selected Codec: {codec}")
 
@@ -624,6 +715,18 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
     video_features = {}
     detailed_results = {}
     try:
+        image_size = resources.get('image_size', 224)  # Get image size from resources, default to 224
+        confidence_threshold = resources.get('confidence_threshold', 0.5)  # Get confidence threshold
+        
+        # Validate image_size
+        if not isinstance(image_size, int) or image_size <= 0:
+            if logging_enabled:
+                print(f"   ⚠️ Warning: Invalid image_size {image_size}, using default 224")
+            image_size = 224
+        
+        if logging_enabled:
+            print(f"   📐 Using image_size: {image_size}x{image_size} for scene classification")
+        
         classification_result = classify_scene_from_path(
             scene_path=scene_path,
             temp_dir=temp_dir,
@@ -633,6 +736,8 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
             metrics_scaler=resources['feature_scaler_step'],
             class_mapping=resources['class_mapping'],
             logging_enabled=logging_enabled,
+            image_size=image_size,
+            confidence_threshold=confidence_threshold
         )
         
         # Handle the tuple return from classify_scene_from_path (now returns 3 items)
@@ -668,10 +773,10 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
     # Map the scene type to lookup table key
     original_scene_type = scene_type
     mapped_scene_type = map_scene_type_to_lookup_key(scene_type)
-    
+
     if logging_enabled and original_scene_type != mapped_scene_type:
         print(f"   🔄 Mapped scene type '{original_scene_type}' -> '{mapped_scene_type}' for CQ lookup")
-    
+
     # Get quality tier information for logging
     print(f"   🎯 Target quality level: {target_quality_level}")
     # If only quality level provided, derive indicative VMAF for logging purposes
@@ -679,13 +784,251 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
         target_vmaf = get_target_vmaf_from_quality(target_quality_level)
         if logging_enabled:
             print(f"   ℹ️ Indicative VMAF from quality level '{target_quality_level}': {target_vmaf}")
-    
-    # Get CQ from lookup table using mapped scene type and target quality/VMAF
-    base_cq = get_cq_from_lookup_table(
-        mapped_scene_type,
-        config,
-        target_vmaf=target_vmaf,
-        target_quality_level=target_quality_level,
+
+    # ============================================================================
+    # NETFLIX PER-TITLE ENCODING SWITCH
+    # ============================================================================
+    # Check if Netflix per-title encoding should be used
+    if should_use_netflix_per_title(config):
+        if logging_enabled:
+            print(f"   🎬 Using Netflix Per-Title Encoding")
+
+        # Prepare resources for Netflix encoding
+        netflix_resources = {
+            'temp_dir': temp_dir,
+            'encoded_scenes_dir': config.get('directories', {}).get('encoded_scenes_dir', './videos/encoded_scenes')
+        }
+
+        # Update scene metadata with classification results
+        scene_metadata.update({
+            'scene_type': scene_type,
+            'confidence_score': confidence_score,
+            'video_features': video_features,
+            'detailed_results': detailed_results
+        })
+
+        # Run Netflix per-title encoding
+        result_metadata = netflix_per_title_encoding(
+            scene_metadata=scene_metadata,
+            config=config,
+            resources=netflix_resources,
+            target_vmaf=target_vmaf,
+            target_quality_level=quality_level_normalized,
+            logging_enabled=logging_enabled
+        )
+
+        # Extract results
+        encoded_path = result_metadata.get('encoded_path')
+        encoding_time = result_metadata.get('encoding_time', 0.0)
+        final_cq = result_metadata.get('cq_used', 0)
+        actual_vmaf = result_metadata.get('actual_vmaf')
+
+        if encoded_path and os.path.exists(encoded_path):
+            # Calculate file sizes and compression ratio
+            original_size = os.path.getsize(scene_path)
+            encoded_size = os.path.getsize(encoded_path)
+            compression_ratio = original_size / encoded_size if encoded_size > 0 else 0.0
+
+            processing_time = time.time() - processing_start_time
+
+            if logging_enabled:
+                print(f"\n✅ Scene {scene_number} Encoding Complete (Netflix Per-Title)")
+                print(f"   📊 VMAF: {actual_vmaf:.2f if actual_vmaf else 'N/A'} (Target: {target_vmaf:.1f})")
+                print(f"   🎯 CQ Used: {final_cq}")
+                print(f"   📦 Compression: {compression_ratio:.2f}x")
+                print(f"   ⏱️ Total Time: {processing_time:.1f}s")
+
+            return True, {
+                'scene_number': scene_number,
+                'encoding_success': True,
+                'encoded_path': encoded_path,
+                'path': scene_path,
+                'original_size_bytes': original_size,
+                'encoded_size_bytes': encoded_size,
+                'compression_ratio': compression_ratio,
+                'cq_used': final_cq,
+                'scene_type': scene_type,
+                'confidence_score': confidence_score,
+                'actual_vmaf': actual_vmaf,
+                'target_vmaf': target_vmaf,
+                'encoding_time_seconds': encoding_time,
+                'processing_time_seconds': processing_time,
+                'encoding_method': 'netflix_per_title',
+                'probe_results': result_metadata.get('probe_results', []),
+                'codec': codec,
+                'codec_mode': codec_mode
+            }
+        else:
+            if logging_enabled:
+                print(f"   ❌ Netflix per-title encoding failed, falling back to lookup table")
+            # Fall through to lookup table method
+
+    # ============================================================================
+    # OPTIMAL BITRATE CONTROLLER (SCENE-AWARE)
+    # ============================================================================
+    # Check if optimal controller should be used
+    from config.optimal_controller_config import (
+        should_use_optimal_controller,
+        map_scene_type_for_optimal_controller,
+        get_vmaf_threshold_from_quality
+    )
+
+    use_optimal_controller = should_use_optimal_controller(config)
+
+    if use_optimal_controller:
+        if logging_enabled:
+            print(f"   🎯 Using OPTIMAL BITRATE CONTROLLER (Scene-Aware)")
+
+        try:
+            from utils.optimal_encoder_wrapper import encode_video_optimal
+
+            # Map scene type for optimal controller
+            optimal_scene_type = map_scene_type_for_optimal_controller(scene_type, confidence_score)
+
+            # ASSERTION: Verify scene type mapping consistency
+            # If classifier says "animation" and confidence is above threshold, controller must use "animation"
+            # This catches plumbing bugs where scene type is lost in translation
+            from config.optimal_controller_config import MIN_SCENE_CONFIDENCE
+            if confidence_score >= MIN_SCENE_CONFIDENCE:
+                scene_lower = str(scene_type).lower()
+                if 'animation' in scene_lower and optimal_scene_type != 'animation':
+                    if logging_enabled:
+                        print(f"   ⚠️ WARNING: Scene type mapping inconsistency!")
+                        print(f"      Classifier: '{scene_type}' (confidence: {confidence_score:.3f})")
+                        print(f"      Mapped to: '{optimal_scene_type}' (expected: 'animation')")
+                        print(f"      This indicates a plumbing bug in scene type mapping.")
+                elif 'gaming' in scene_lower and optimal_scene_type != 'gaming':
+                    if logging_enabled:
+                        print(f"   ⚠️ WARNING: Scene type mapping inconsistency!")
+                        print(f"      Classifier: '{scene_type}' → Mapped: '{optimal_scene_type}' (expected: 'gaming')")
+                elif 'screen' in scene_lower and optimal_scene_type != 'screen':
+                    if logging_enabled:
+                        print(f"   ⚠️ WARNING: Scene type mapping inconsistency!")
+                        print(f"      Classifier: '{scene_type}' → Mapped: '{optimal_scene_type}' (expected: 'screen')")
+                elif 'face' in scene_lower and optimal_scene_type != 'faces':
+                    if logging_enabled:
+                        print(f"   ⚠️ WARNING: Scene type mapping inconsistency!")
+                        print(f"      Classifier: '{scene_type}' → Mapped: '{optimal_scene_type}' (expected: 'faces')")
+
+            # Get VMAF threshold
+            if not target_vmaf or target_vmaf == 0:
+                target_vmaf = get_vmaf_threshold_from_quality(quality_level_normalized if 'quality_level_normalized' in locals() else 'Medium')
+
+            if logging_enabled:
+                print(f"   🎭 Optimal controller scene type: {optimal_scene_type}")
+                print(f"   🎯 VMAF threshold: {target_vmaf}")
+                print(f"   ⚙️ Codec mode: {codec_mode}")
+
+            # Prepare output path
+            # BUG FIX #5: Add unique identifier to prevent cross-request contamination
+            import uuid
+            unique_id = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID for brevity
+
+            if scene_duration < 1.0:
+                output_scene_path = os.path.join(
+                    temp_dir,
+                    f"encoded_scene_{scene_number:03d}_{start_time:.1f}s-{end_time:.1f}s_{codec.lower()}_{unique_id}.mp4"
+                )
+            else:
+                output_scene_path = os.path.join(
+                    temp_dir,
+                    f"encoded_scene_{scene_number:03d}_{start_time:.0f}s-{end_time:.0f}s_{codec.lower()}_{unique_id}.mp4"
+                )
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Encode with optimal controller
+            encoded_path, encoding_time = encode_video_optimal(
+                input_path=scene_path,
+                output_path=output_scene_path,
+                codec=codec,
+                vmaf_threshold=target_vmaf,
+                codec_mode=codec_mode,
+                target_bitrate=target_bitrate,
+                scene_type=optimal_scene_type,
+                contrast_value=0.5,
+                duration=scene_duration,
+                skip_cq_mapping=True,
+                logging_enabled=logging_enabled,
+                use_optimal_controller=True
+            )
+
+            if encoded_path and os.path.exists(encoded_path):
+                # Success! Calculate metrics
+                original_size = os.path.getsize(scene_path)
+                encoded_size = os.path.getsize(encoded_path)
+                compression_ratio = original_size / encoded_size if encoded_size > 0 else 0.0
+                processing_time = time.time() - processing_start_time
+
+                if logging_enabled:
+                    print(f"\n✅ Scene {scene_number} Encoding Complete (Optimal Controller)")
+                    print(f"   📦 Compression: {compression_ratio:.2f}x")
+                    print(f"   ⏱️ Total Time: {processing_time:.1f}s")
+
+                # Return success with optimal controller results
+                # IMPORTANT: Return (encoded_path, dict) not (True, dict) to match expected format
+                return encoded_path, {
+                    'scene_number': scene_number,
+                    'encoding_success': True,
+                    'encoded_path': encoded_path,
+                    'path': scene_path,
+                    'original_size_bytes': original_size,
+                    'encoded_size_bytes': encoded_size,
+                    'compression_ratio': compression_ratio,
+                    'scene_type': scene_type,
+                    'optimal_scene_type': optimal_scene_type,
+                    'confidence_score': confidence_score,
+                    'target_vmaf': target_vmaf,
+                    'encoding_time_seconds': encoding_time,
+                    'processing_time_seconds': processing_time,
+                    'encoding_method': 'optimal_controller',
+                    'codec': codec,
+                    'codec_mode': codec_mode,
+                    'model_training_data': {
+                        'raw_video_features': video_features,
+                        'scene_classifier_probabilities': detailed_results,
+                        'processing_timings': {
+                            'total_processing_time': processing_time,
+                            'encoding_time': encoding_time
+                        }
+                    }
+                }
+            else:
+                if logging_enabled:
+                    print(f"   ⚠️ Optimal controller encoding failed, falling back to lookup table")
+                # Fall through to lookup table method
+
+        except Exception as e:
+            if logging_enabled:
+                print(f"   ❌ Optimal controller error: {e}")
+                traceback.print_exc()
+                print(f"   🔄 Falling back to lookup table method")
+            # Fall through to lookup table method
+
+    # ============================================================================
+    # LOOKUP TABLE ENCODING (DEFAULT/FALLBACK)
+    # ============================================================================
+
+    if logging_enabled and use_optimal_controller:
+        print(f"   📋 Using lookup table method (fallback)")
+
+    # Get CQ from lookup table using mapped scene type, target quality/VMAF, and codec
+    # Use codec-specific CQ values from advanced_encoding_config to avoid double-mapping
+    from config.advanced_encoding_config import get_cq_value
+
+    # Map quality level to config format
+    quality_level_map = {'high': 'High', 'medium': 'Medium', 'low': 'Low'}
+    quality_level_normalized = quality_level_map.get(str(target_quality_level).lower(), target_quality_level) if target_quality_level else 'Medium'
+
+    # Get codec-specific CQ value with granular override support
+    # Extract input bitrate from metadata if available
+    input_bitrate_kbps = original_video_metadata.get('bitrate', 0)
+    input_bitrate_mbps = input_bitrate_kbps / 1000.0 if input_bitrate_kbps else target_bitrate
+
+    base_cq = get_cq_value(
+        codec=codec,
+        quality_level=quality_level_normalized,
+        scene_type=mapped_scene_type,
+        input_bitrate_mbps=input_bitrate_mbps
     )
     
     # Log quality tier and CQ selection
@@ -702,7 +1045,17 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
                 tier_label = "LOW"
 
         print(f"   🎯 Using quality tier: {tier_label} (Indicative VMAF: {target_vmaf if target_vmaf else 'n/a'})")
-        print(f"   🎚️ Base CQ from lookup table for '{mapped_scene_type}' at {tier_label} quality: {base_cq}")
+
+        # Check if granular override was used
+        try:
+            from config.granular_cq_overrides import has_granular_override, get_override_key
+            if has_granular_override(mapped_scene_type, codec, codec_mode, input_bitrate_mbps, target_vmaf):
+                override_key = get_override_key(mapped_scene_type, codec, codec_mode, input_bitrate_mbps, target_vmaf)
+                print(f"   ⭐ Using GRANULAR OVERRIDE: {override_key} → CQ={base_cq}")
+            else:
+                print(f"   🎚️ Base CQ from lookup table for '{mapped_scene_type}' at {tier_label} quality: {base_cq}")
+        except ImportError:
+            print(f"   🎚️ Base CQ from lookup table for '{mapped_scene_type}' at {tier_label} quality: {base_cq}")
     
     # Apply conservative adjustment from config
     conservative_cq_adjustment = safe_float(config.get('video_processing', {}).get('conservative_cq_adjustment', 2), 2)
@@ -730,15 +1083,19 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
     'base_cq_for_quality': base_cq,
     }
 
+    # BUG FIX #5: Add unique identifier to prevent cross-request contamination
+    import uuid
+    unique_id = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID for brevity
+
     if scene_duration < 1.0:
         output_scene_path = os.path.join(
             temp_dir,
-            f"encoded_scene_{scene_number:03d}_{start_time:.1f}s-{end_time:.1f}s_{codec.lower()}.mp4"
+            f"encoded_scene_{scene_number:03d}_{start_time:.1f}s-{end_time:.1f}s_{codec.lower()}_{unique_id}.mp4"
         )
     else:
         output_scene_path = os.path.join(
             temp_dir,
-            f"encoded_scene_{scene_number:03d}_{start_time:.0f}s-{end_time:.0f}s_{codec.lower()}.mp4"
+            f"encoded_scene_{scene_number:03d}_{start_time:.0f}s-{end_time:.0f}s_{codec.lower()}_{unique_id}.mp4"
         )
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -762,7 +1119,9 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
                 contrast_value=0.5,
                 codec_mode=codec_mode,
                 target_bitrate=target_bitrate,
+                duration=scene_duration,  # Pass scene duration for duration-based preset selection
                 max_retries=max_encoding_retries,
+                skip_cq_mapping=True,  # CQ is already codec-specific from advanced_encoding_config
                 logging_enabled=logging_enabled
             )
         except Exception as e:
@@ -781,6 +1140,8 @@ def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_qual
                 contrast_value=0.5,  # Default contrast
                 codec_mode=codec_mode,
                 target_bitrate=target_bitrate,
+                duration=scene_duration,  # Pass scene duration for duration-based preset selection
+                skip_cq_mapping=True,  # CQ is already codec-specific from advanced_encoding_config
                 logging_enabled=logging_enabled
             )
             encoded_path = output_scene_path

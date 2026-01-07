@@ -3,6 +3,130 @@ import time
 
 from utils.calculate_vmaf_adv import calculate_vmaf_advanced
 
+def calculate_scene_vmaf(scene_metadata, config, logging_enabled=True):
+    """
+    Calculate VMAF for a single scene.
+    
+    Args:
+        scene_metadata (dict): Scene metadata containing:
+            - path: Original scene video path
+            - encoded_path: Encoded scene video path
+            - scene_number: Scene number
+            - target_vmaf: Target VMAF score (optional)
+        config (dict): Configuration dictionary with VMAF settings
+        logging_enabled (bool): Whether to enable detailed logging
+        
+    Returns:
+        dict: Updated scene metadata with VMAF results
+    """
+    scene_number = scene_metadata.get('scene_number', 0)
+    original_path = scene_metadata.get('path')
+    encoded_path = scene_metadata.get('encoded_path')
+    target_vmaf = scene_metadata.get('target_vmaf') or config.get('video_processing', {}).get('target_vmaf', 93.0)
+    
+    # Initialize result with scene metadata
+    result = scene_metadata.copy()
+    result.update({
+        'actual_vmaf': None,
+        'vmaf_calculation_status': 'failed',
+        'vmaf_calculation_time': 0.0,
+        'vmaf_calculation_notes': None,
+        'target_achieved': None
+    })
+    
+    # Check if required paths exist
+    if not original_path or not encoded_path:
+        result['vmaf_calculation_notes'] = 'Missing original or encoded path'
+        if logging_enabled:
+            print(f"      ❌ Scene {scene_number}: Missing paths (original: {original_path}, encoded: {encoded_path})")
+        return result
+    
+    if not os.path.exists(original_path):
+        result['vmaf_calculation_notes'] = f'Original file not found: {original_path}'
+        if logging_enabled:
+            print(f"      ❌ Scene {scene_number}: Original file not found: {original_path}")
+        return result
+    
+    if not os.path.exists(encoded_path):
+        result['vmaf_calculation_notes'] = f'Encoded file not found: {encoded_path}'
+        if logging_enabled:
+            print(f"      ❌ Scene {scene_number}: Encoded file not found: {encoded_path}")
+        return result
+    
+    # Get VMAF calculation settings from config
+    vmaf_config = config.get('vmaf_calculation', {})
+    use_sampling = vmaf_config.get('vmaf_use_sampling', True)
+    num_clips = vmaf_config.get('vmaf_num_clips', 3)
+    clip_duration = vmaf_config.get('vmaf_clip_duration', 2)
+    use_vmafneg = vmaf_config.get('use_vmafneg', False)
+    
+    # Check if VMAF calculation is enabled
+    calculate_scene_vmaf = vmaf_config.get('calculate_scene_vmaf', True)
+    if not calculate_scene_vmaf:
+        result['vmaf_calculation_status'] = 'skipped'
+        result['vmaf_calculation_notes'] = 'VMAF calculation disabled in config'
+        if logging_enabled:
+            print(f"      ⏭️  Scene {scene_number}: VMAF calculation disabled")
+        return result
+    
+    # Calculate VMAF
+    calc_start_time = time.time()
+    
+    try:
+        if logging_enabled:
+            print(f"      🔍 Scene {scene_number}: Calculating VMAF...")
+            print(f"         Original: {os.path.basename(original_path)}")
+            print(f"         Encoded: {os.path.basename(encoded_path)}")
+        
+        vmaf_score = calculate_vmaf_advanced(
+            input_file=original_path,
+            encoded_file=encoded_path,
+            use_sampling=use_sampling,
+            num_clips=num_clips,
+            clip_duration=clip_duration,
+            use_downscaling=False,
+            use_parallel=False,
+            use_vmafneg=use_vmafneg,
+            default_vmaf_model_path_config=config.get('model_paths', {}).get('default_vmaf_model'),
+            vmafneg_model_path_config=config.get('model_paths', {}).get('vmafneg_model'),
+            use_frame_rate_scaling=False,
+            logging_enabled=logging_enabled
+        )
+        
+        calc_time = time.time() - calc_start_time
+        
+        if vmaf_score is not None:
+            result['actual_vmaf'] = round(vmaf_score, 2)
+            result['vmaf_calculation_status'] = 'success'
+            result['vmaf_calculation_time'] = calc_time
+            result['target_achieved'] = vmaf_score >= target_vmaf
+            result['vmaf_calculation_notes'] = f'VMAF calculated successfully using {"sampling" if use_sampling else "full video"}'
+            
+            if logging_enabled:
+                status = "✅" if result['target_achieved'] else "⚠️"
+                print(f"      {status} Scene {scene_number}: VMAF = {vmaf_score:.2f} (target: {target_vmaf:.1f}, time: {calc_time:.1f}s)")
+        else:
+            result['vmaf_calculation_status'] = 'failed'
+            result['vmaf_calculation_time'] = calc_time
+            result['vmaf_calculation_notes'] = 'VMAF calculation returned None'
+            
+            if logging_enabled:
+                print(f"      ❌ Scene {scene_number}: VMAF calculation returned None (time: {calc_time:.1f}s)")
+        
+    except Exception as e:
+        calc_time = time.time() - calc_start_time
+        result['vmaf_calculation_status'] = 'failed'
+        result['vmaf_calculation_time'] = calc_time
+        result['vmaf_calculation_notes'] = f'VMAF calculation error: {str(e)}'
+        
+        if logging_enabled:
+            print(f"      ❌ Scene {scene_number}: VMAF calculation failed: {e} (time: {calc_time:.1f}s)")
+        import traceback
+        if logging_enabled:
+            traceback.print_exc()
+    
+    return result
+
 def calculate_multiple_scenes_vmaf(scenes_metadata_list, config, logging_enabled=True):
     """
     Calculate VMAF for multiple scenes sequentially.
