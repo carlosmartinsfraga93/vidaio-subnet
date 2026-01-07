@@ -63,7 +63,7 @@ class BaseMiner(ABC):
                 config.wallet.name,
                 config.wallet.hotkey,
                 config.netuid,
-                "validator",
+                "miner",
             )
         )
         os.makedirs(config.full_path, exist_ok=True)

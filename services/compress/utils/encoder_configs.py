@@ -106,7 +106,7 @@ ENCODER_SETTINGS = {
         "aq-mode": 2, "aq-strength": 1.0
     },
     "hevc_nvenc": {
-        "codec": "hevc_nvenc", "preset": "p4", "rc": "constqp", "cq": 22, "keyint": 50,
+        "codec": "hevc_nvenc", "preset": "p5", "rc": "constqp", "cq": 22, "keyint": 50,
         "spatial-aq": 1, "temporal-aq": 0
     },
     "h264_nvenc": {
