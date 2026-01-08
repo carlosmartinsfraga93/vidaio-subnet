@@ -15,6 +15,14 @@ UPDATED: Now includes scene-aware parameters for optimal scoring
 import math
 from typing import Tuple, Dict, Optional
 
+# NOTE:
+# This module is imported in two different ways across the repo:
+# 1) As a package import: `from services.compress.utils.optimal_bitrate_controller import ...`
+# 2) As a local script import when running from this directory: `from optimal_bitrate_controller import ...`
+#
+# To keep both working, any cross-package imports must be done lazily (inside functions)
+# with safe fallbacks.
+
 
 def clamp(min_val: float, value: float, max_val: float) -> float:
     """Clamp value between min and max."""
@@ -82,12 +90,56 @@ SCENE_MIN_BITRATE_4K30_T93 = {
 
 # Scene base minimum bitrates (Mbps, 4K30, aggressive but safe)
 SCENE_BASE_BITRATE = {
-    'screen': 1.0,
-    'faces': 2.2,
-    'gaming': 2.8,
-    'animation': 2.4,
-    'other': 2.0
+    # Slightly less aggressive than the original values to reduce VMAF misses.
+    # These are still *baselines* and are further adjusted by complexity/motion/threshold.
+    'screen': 1.2,
+    'faces': 2.5,
+    'gaming': 3.0,
+    'animation': 2.8,
+    'other': 2.3
 }
+
+
+# Reference pixel domain for the base scene minima above (4K @ 30fps)
+_REF_W, _REF_H, _REF_FPS = 3840, 2160, 30.0
+
+
+def _resolution_scale(width: Optional[int], height: Optional[int], fps: Optional[float]) -> float:
+    """Compute a conservative scaling factor from the 4K30 baseline.
+
+    Important: bitrate does not scale strictly linearly with pixel count in practice,
+    so we use sub-linear exponents for resolution and fps.
+
+    Returns 1.0 when any parameter is missing.
+    """
+    if not width or not height or not fps:
+        return 1.0
+
+    # Guard against division by zero / weird metadata
+    fps = max(1e-3, float(fps))
+
+    pixel_ratio = (float(width) * float(height)) / (_REF_W * _REF_H)
+    fps_ratio = fps / _REF_FPS
+
+    # Sub-linear scaling empirically matches "4K is ~2-3x 1080p" rather than 4x.
+    return (pixel_ratio ** 0.60) * (fps_ratio ** 0.80)
+
+
+def _map_scene_to_quality_scene(scene: str) -> str:
+    """Map this controller's scene types to advanced_encoding_config scene keys."""
+    if scene == 'faces':
+        return 'low-action'
+    if scene == 'other':
+        return 'medium-action'
+    return scene
+
+
+def _quality_level_from_vmaf(vmaf_threshold: float) -> str:
+    if vmaf_threshold >= 93:
+        return 'High'
+    if vmaf_threshold >= 89:
+        return 'Medium'
+    return 'Low'
 
 # Scene complexity coefficients for minimum bitrate
 SCENE_COMPLEXITY_COEFF = {
@@ -125,6 +177,17 @@ SCENE_VBR_BUFSIZE = {
     'other': 2.5
 }
 
+# Scene-specific maxrate multipliers for VBR.
+# A slightly looser maxrate helps preserve quality on transient complexity without
+# forcing the average bitrate to increase as much as raising b:v.
+SCENE_VBR_MAXRATE = {
+    'screen': 1.05,
+    'faces': 1.08,
+    'gaming': 1.15,
+    'animation': 1.15,
+    'other': 1.10,
+}
+
 
 def normalize_scene_type(scene_type: Optional[str]) -> str:
     """
@@ -158,7 +221,10 @@ def normalize_original_bitrate(
     bitrate_orig: float,
     complexity: float,
     scene_type: str = 'other',
-    use_floor: bool = True
+    use_floor: bool = True,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None
 ) -> float:
     """
     Normalize original bitrate to reduce ffprobe noise (scene-aware).
@@ -186,13 +252,17 @@ def normalize_original_bitrate(
     # Normalize scene type
     scene = normalize_scene_type(scene_type)
 
-    # Scene-dependent clamp
+    # Scene-dependent clamp (tuned at 4K30) with resolution/fps scaling.
+    scale = _resolution_scale(width, height, fps)
     min_bitrate, max_bitrate = SCENE_BITRATE_CLAMP.get(scene, (20.0, 65.0))
+    min_bitrate *= scale
+    max_bitrate *= scale
     b_norm = clamp(min_bitrate, bitrate_orig, max_bitrate)
 
     # Optional content-based floor
     if use_floor:
-        b_floor = clamp(20.0, 18.0 + 6.0 * (complexity - 6.0), 45.0)
+        # Complexity-driven floor (also scaled to match the input resolution/fps).
+        b_floor = clamp(20.0 * scale, (18.0 + 6.0 * (complexity - 6.0)) * scale, 45.0 * scale)
         b_norm = max(b_norm, b_floor)
 
     return b_norm
@@ -278,7 +348,10 @@ def calculate_minimum_bitrate(
     codec: str,
     vmaf_threshold: float,
     mode: str,
-    scene_type: str = 'other'
+    scene_type: str = 'other',
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None
 ) -> float:
     """
     Predict minimum bitrate to clear VMAF threshold - SCENE-AWARE.
@@ -330,8 +403,11 @@ def calculate_minimum_bitrate(
     a_s = coeffs['a']
     b_s = coeffs['b']
 
-    # Calculate minimum bitrate
+    # Calculate minimum bitrate (baseline is 4K30)
     b_min = b0 * (1.0 + a_s * max(0.0, complexity - 6.2)) + b_s * motion
+
+    # Resolution/fps scaling from the 4K30 baseline.
+    b_min *= _resolution_scale(width, height, fps)
 
     # Threshold strictness bias
     if vmaf_threshold >= 93:
@@ -349,6 +425,7 @@ def calculate_minimum_bitrate(
 
     # Clamp to reasonable range (increased upper bound for high VMAF)
     max_bitrate = 15.0 if vmaf_threshold >= 93 else 10.0
+    max_bitrate *= _resolution_scale(width, height, fps)
     return clamp(0.8, b_min, max_bitrate)
 
 
@@ -361,7 +438,10 @@ def calculate_target_bitrate(
     mode: str,
     scene_type: str = 'other',
     grain: float = 0.0,
-    texture: float = 0.0
+    texture: float = 0.0,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None
 ) -> Tuple[float, float, float]:
     """
     Calculate optimal target bitrate for score maximization - SCENE-AWARE.
@@ -390,7 +470,15 @@ def calculate_target_bitrate(
     scene = normalize_scene_type(scene_type)
 
     # Step 1: Normalize original bitrate (scene-aware)
-    b_orig_norm = normalize_original_bitrate(bitrate_orig, complexity, scene_type, use_floor=True)
+    b_orig_norm = normalize_original_bitrate(
+        bitrate_orig,
+        complexity,
+        scene_type,
+        use_floor=True,
+        width=width,
+        height=height,
+        fps=fps,
+    )
 
     # Step 2: Calculate target ratio (VMAF-aware, scene-aware, codec-aware)
     r_target = calculate_target_ratio(complexity, vmaf_threshold, codec, scene_type)
@@ -399,33 +487,47 @@ def calculate_target_bitrate(
     b_ratio = b_orig_norm / r_target
 
     # Step 4: Calculate minimum bitrate for threshold safety (scene-aware)
-    b_min = calculate_minimum_bitrate(complexity, motion, codec, vmaf_threshold, mode, scene_type)
+    b_min = calculate_minimum_bitrate(
+        complexity,
+        motion,
+        codec,
+        vmaf_threshold,
+        mode,
+        scene_type,
+        width=width,
+        height=height,
+        fps=fps,
+    )
 
-    # Step 5: Apply resolution-based bitrate floor for high VMAF targets
-    # For 4K30, target_vmaf >= 93, enforce scene-specific minimums
+    # Step 5: Apply additional floor for high VMAF targets.
+    # Floors are defined at 4K30; scale down/up with resolution/fps.
     if vmaf_threshold >= 93:
-        # Get video resolution from bitrate_orig (approximate)
-        # 4K30 typically has bitrate > 15 Mbps, 1080p30 typically < 10 Mbps
-        is_4k = bitrate_orig > 15.0
-
-        if is_4k:
-            # Apply 4K30 floor
-            floor_4k = SCENE_MIN_BITRATE_4K30_T93.get(scene, 8.0)
-            b_min = max(b_min, floor_4k)
-        else:
-            # For 1080p, scale down by 4x (resolution ratio)
-            floor_1080p = SCENE_MIN_BITRATE_4K30_T93.get(scene, 8.0) / 4.0
-            b_min = max(b_min, floor_1080p)
+        floor_ref = SCENE_MIN_BITRATE_4K30_T93.get(scene, 8.0)
+        floor_scaled = floor_ref * _resolution_scale(width, height, fps)
+        b_min = max(b_min, floor_scaled)
 
     # Step 6: Final target bitrate (push ratio but respect safety)
-    b_target = max(b_ratio, b_min)
+    # Keep a small headroom above min_bitrate to avoid borderline failures.
+    b_target = max(b_ratio, b_min * 1.05)
 
     return b_target, r_target, b_min
 
 
-def calculate_initial_cq(complexity: float, codec: str, scene_type: str = 'other') -> int:
+def calculate_initial_cq(
+    complexity: float,
+    codec: str,
+    scene_type: str = 'other',
+    vmaf_threshold: float = 89.0,
+    mode: str = 'CRF',
+    bitrate_target: Optional[float] = None,
+    min_bitrate: Optional[float] = None,
+) -> int:
     """
-    Calculate initial CQ value for CRF mode - SCENE-AWARE.
+    Calculate initial CQ value (used for CRF and as a quality floor in VBR).
+
+    This version is VMAF-aware and uses production-derived CQ tables from
+    `services.compress.config.advanced_encoding_config` as the base, then applies
+    small adjustments using complexity and bitrate headroom.
 
     Scene-aware initial CQ:
 
@@ -461,18 +563,65 @@ def calculate_initial_cq(complexity: float, codec: str, scene_type: str = 'other
     codec_lower = codec.lower()
     scene = normalize_scene_type(scene_type)
 
-    # Get codec-specific scene baselines
+    # --- Base CQ from production lookup tables (vmaf_threshold -> quality level) ---
+    quality_level = _quality_level_from_vmaf(vmaf_threshold)
+    quality_scene = _map_scene_to_quality_scene(scene)
+
+    # Map codec family to the tables used by advanced_encoding_config
+    codec_key = 'av1_nvenc' if 'av1' in codec_lower else 'hevc_nvenc'
+
+    try:
+        # Normal runtime path (repo root on sys.path)
+        from services.compress.config.advanced_encoding_config import get_cq_value  # type: ignore
+    except Exception:
+        try:
+            # Imported as a package module under services.compress.utils
+            from ..config.advanced_encoding_config import get_cq_value  # type: ignore
+        except Exception:
+            # Local script execution path (cwd = services/compress/utils).
+            # Add repo root to sys.path so `services.*` imports work.
+            import os
+            import sys
+
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+
+            from services.compress.config.advanced_encoding_config import get_cq_value  # type: ignore
+
+    base_cq = int(get_cq_value(codec_key, quality_level, quality_scene, input_bitrate_mbps=None))
+
+    cq = float(base_cq)
+
+    # --- Complexity adjustment ---
+    # Lower complexity => allow higher CQ (more compression).
+    # Higher complexity => lower CQ (protect VMAF).
+    pivot = 5.5
+    cq += 0.7 * (pivot - float(complexity))
+
+    # --- Bitrate headroom adjustment (if available) ---
+    if bitrate_target is not None and min_bitrate is not None and min_bitrate > 0:
+        headroom = float(bitrate_target) / float(min_bitrate)
+        if headroom < 1.05:
+            cq -= 3.0
+        elif headroom < 1.15:
+            cq -= 2.0
+        elif headroom > 1.80:
+            cq += 2.0
+        elif headroom > 1.60:
+            cq += 1.0
+
+    # VBR tends to be less stable at a fixed bitrate cap: slightly protect quality.
+    if mode.upper() == 'VBR':
+        cq -= 1.0
+
+    # Clamp to conservative ranges (NVENC-friendly)
     if 'av1' in codec_lower:
-        cq_scene = SCENE_INITIAL_CQ['av1'].get(scene, 29)
-        cq_min, cq_max = 20, 38
-    else:  # HEVC
-        cq_scene = SCENE_INITIAL_CQ['hevc'].get(scene, 25)
-        cq_min, cq_max = 18, 34
+        cq_min, cq_max = 16, 32
+    else:
+        cq_min, cq_max = 14, 30
 
-    # Adjust for complexity
-    cq = cq_scene + 1.8 * (complexity - 6.2)
-
-    return int(clamp(cq_min, cq, cq_max))
+    return int(clamp(cq_min, round(cq), cq_max))
 
 
 def update_cq_after_encode(
@@ -602,7 +751,7 @@ def calculate_vbr_settings(target_bitrate: float, scene_type: str = 'other') -> 
     Calculate VBR rate control settings (tight VBV) - SCENE-AWARE.
 
     b:v = B_target
-    maxrate = 1.05 * B_target
+    maxrate = scene-dependent multiplier * B_target
     bufsize = scene-dependent multiplier * B_target
 
     Scene-specific buffer sizes:
@@ -621,11 +770,12 @@ def calculate_vbr_settings(target_bitrate: float, scene_type: str = 'other') -> 
     """
     scene = normalize_scene_type(scene_type)
     bufsize_mult = SCENE_VBR_BUFSIZE.get(scene, 2.5)
+    maxrate_mult = SCENE_VBR_MAXRATE.get(scene, 1.10)
 
     # Convert to Python float to avoid numpy.float64 issues
     return {
         'b:v': float(target_bitrate),
-        'maxrate': float(1.05 * target_bitrate),
+        'maxrate': float(maxrate_mult * target_bitrate),
         'bufsize': float(bufsize_mult * target_bitrate)
     }
 

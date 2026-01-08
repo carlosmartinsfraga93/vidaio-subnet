@@ -31,8 +31,7 @@ def encode_video_optimal(
     duration: Optional[float] = None,
     skip_cq_mapping: bool = False,
     logging_enabled: bool = True,
-    use_optimal_controller: bool = True,
-    min_required_bitrate: Optional[float] = None
+    use_optimal_controller: bool = True
 ) -> Tuple[str, float]:
     """
     Encode video using optimal bitrate controller - SCENE-AWARE.
@@ -53,7 +52,6 @@ def encode_video_optimal(
         skip_cq_mapping: Skip CQ mapping (optional)
         logging_enabled: Enable logging
         use_optimal_controller: Use optimal controller (set False to use legacy)
-        min_required_bitrate: Minimum required bitrate for VMAF safety (Mbps)
 
     Returns:
         Tuple of (output_path, encoding_time)
@@ -132,38 +130,18 @@ def encode_video_optimal(
             if logging_enabled:
                 print(f"⚠️ VBR ceiling applied: target_bitrate={target_bitrate:.2f} Mbps")
     else:  # VBR
-        # Use target bitrate from optimal controller
-        controller_bitrate = optimal_params['target_bitrate']
-
-        # BUG FIX #1: Enforce minimum bitrate clamp for VMAF safety
-        if min_required_bitrate and controller_bitrate < min_required_bitrate:
-            if logging_enabled:
-                print(f"\n⚠️ MINIMUM BITRATE CLAMP APPLIED:")
-                print(f"   Controller target: {controller_bitrate:.2f} Mbps")
-                print(f"   Minimum required: {min_required_bitrate:.2f} Mbps")
-                print(f"   Using minimum for VMAF safety (deficit: {min_required_bitrate - controller_bitrate:.2f} Mbps)")
-
-            target_bitrate = min_required_bitrate
-            rate = min_required_bitrate
-
-            # Recalculate VBR settings with clamped bitrate
-            from .optimal_bitrate_controller import calculate_vbr_settings
-            optimal_params['vbr_settings'] = calculate_vbr_settings(min_required_bitrate, scene_type)
-            optimal_params['target_bitrate'] = min_required_bitrate
-        else:
-            target_bitrate = controller_bitrate
-            rate = controller_bitrate
+        # Use CQ value for quality control AND target bitrate for ceiling
+        # CQ sets the quality floor, bitrate sets the ceiling
+        rate = optimal_params.get('initial_cq', 30)
+        target_bitrate = optimal_params['target_bitrate']
 
     if logging_enabled:
         print(f"\n📝 Encoding with:")
-        print(f"   Rate parameter: {rate}")
+        print(f"   CQ (quality floor): {rate}")
         if target_bitrate:
-            print(f"   Target bitrate: {target_bitrate:.2f} Mbps")
+            print(f"   Target bitrate (ceiling): {target_bitrate:.2f} Mbps")
         print(f"   Expected ratio: {optimal_params['target_ratio']:.1f}x")
         print(f"   Complexity: {optimal_params['complexity']:.2f}")
-    
-    # BUG FIX #2: Pass VBR settings to encode_video to prevent overwriting
-    vbr_settings = optimal_params.get('vbr_settings') if codec_mode.upper() == 'VBR' else None
 
     # Encode video using existing encode_video function
     encoding_log, encoding_time = encode_video(
@@ -177,8 +155,7 @@ def encode_video_optimal(
         target_bitrate=target_bitrate,
         duration=duration,
         skip_cq_mapping=True,  # Skip CQ mapping, we already calculated optimal CQ
-        logging_enabled=logging_enabled,
-        vbr_settings=vbr_settings  # Pass controller's VBR settings
+        logging_enabled=logging_enabled
     )
 
     total_time = time.time() - start_time

@@ -156,7 +156,10 @@ def get_optimal_encoding_params(
         mode=mode,
         scene_type=scene_type,
         grain=metrics['grain'],
-        texture=metrics['texture']
+        texture=metrics['texture'],
+        width=int(metrics.get('width', 0) or 0),
+        height=int(metrics.get('height', 0) or 0),
+        fps=float(metrics.get('fps', 0.0) or 0.0),
     )
 
     result = {
@@ -170,13 +173,32 @@ def get_optimal_encoding_params(
 
     # Mode-specific parameters
     if mode.upper() == 'CRF':
-        result['initial_cq'] = calculate_initial_cq(complexity, codec, scene_type)
+        result['initial_cq'] = calculate_initial_cq(
+            complexity,
+            codec,
+            scene_type,
+            vmaf_threshold=vmaf_threshold,
+            mode=mode,
+            bitrate_target=target_bitrate,
+            min_bitrate=min_bitrate,
+        )
         if logging_enabled:
             print(f"🎯 CRF Mode - Initial CQ: {result['initial_cq']} (scene: {scene_type})")
     else:  # VBR
         result['vbr_settings'] = calculate_vbr_settings(target_bitrate, scene_type)
+        # VBR mode also needs CQ for quality control (quality floor)
+        result['initial_cq'] = calculate_initial_cq(
+            complexity,
+            codec,
+            scene_type,
+            vmaf_threshold=vmaf_threshold,
+            mode=mode,
+            bitrate_target=target_bitrate,
+            min_bitrate=min_bitrate,
+        )
         if logging_enabled:
             print(f"🎯 VBR Mode - Settings: {result['vbr_settings']} (scene: {scene_type})")
+            print(f"   CQ for quality floor: {result['initial_cq']}")
 
     if logging_enabled:
         print(f"📊 Optimal Encoding Parameters:")

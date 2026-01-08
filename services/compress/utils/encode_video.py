@@ -256,7 +256,7 @@ def get_contrast_optimized_params(scene_type, contrast_value, codec):
     
     return params
 
-def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, duration=None, skip_cq_mapping=False, logging_enabled=True, vbr_settings=None):
+def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_type=None, contrast_value=None, codec_mode=None, target_bitrate=None, duration=None, skip_cq_mapping=False, logging_enabled=True):
     """
     Encodes a video using specified codec settings, optimized for scene type and contrast.
     Audio is copied without re-encoding for efficiency.
@@ -533,7 +533,6 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     }
 
     # For NVENC encoders, handle CQ/QP properly based on rate control mode
-    # CRITICAL FIX: Do NOT use -qp in VBR mode as it conflicts with rate control
     try:
         if codec.endswith('_nvenc'):
             rc_value = current_settings.get('rc', None)
@@ -541,20 +540,15 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
 
             if 'cq' in current_settings and 'qp' not in current_settings:
                 if is_vbr_mode:
-                    # VBR mode: Remove CQ/QP entirely, rely on AQ settings for quality
-                    # Using -qp in VBR mode causes unpredictable quality issues
-                    cq_value = current_settings.pop('cq')
+                    # VBR mode: Keep CQ for quality control, it works with VBR
+                    # CQ sets the quality floor while VBR caps the bitrate ceiling
+                    cq_value = current_settings.get('cq')
                     if logging_enabled:
-                        print(f"⚠️ VBR mode detected for {codec}: Removing CQ={cq_value} (incompatible with VBR)")
-                        print(f"   Quality will be controlled by spatial-aq, temporal-aq, and aq-strength")
+                        print(f"✅ VBR mode with CQ={cq_value} for {codec}")
+                        print(f"   CQ controls quality floor, bitrate controls ceiling")
 
-                    # Ensure AQ settings are present for quality control
-                    if 'spatial-aq' not in current_settings:
-                        current_settings['spatial-aq'] = 1
-                    if 'temporal-aq' not in current_settings:
-                        current_settings['temporal-aq'] = 1
-                    if 'aq-strength' not in current_settings:
-                        current_settings['aq-strength'] = 8  # Higher for better quality
+                    # Keep CQ as-is for VBR mode (don't convert to qp)
+                    # NVENC VBR mode supports -cq parameter directly
                 else:
                     # CRF/constqp mode: Translate cq to qp
                     current_settings['qp'] = int(current_settings.pop('cq'))

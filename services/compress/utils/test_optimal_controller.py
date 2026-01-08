@@ -127,18 +127,18 @@ class TestCRFMode(unittest.TestCase):
         """Test initial CQ calculation for AV1."""
         # Easy content
         cq = calculate_initial_cq(complexity=6.0, codec='av1')
-        self.assertGreaterEqual(cq, 20)
-        self.assertLessEqual(cq, 38)
+        self.assertGreaterEqual(cq, 16)
+        self.assertLessEqual(cq, 32)
         
         # Hard content
         cq_hard = calculate_initial_cq(complexity=8.0, codec='av1')
-        self.assertGreater(cq_hard, cq)  # Higher complexity = higher CQ
+        self.assertLess(cq_hard, cq)  # Higher complexity => lower CQ (protect quality)
     
     def test_initial_cq_hevc(self):
         """Test initial CQ calculation for HEVC."""
         cq = calculate_initial_cq(complexity=6.0, codec='hevc')
-        self.assertGreaterEqual(cq, 18)
-        self.assertLessEqual(cq, 34)
+        self.assertGreaterEqual(cq, 14)
+        self.assertLessEqual(cq, 30)
     
     def test_cq_update_emergency(self):
         """Test CQ update in emergency (VMAF below threshold)."""
@@ -210,7 +210,7 @@ class TestVBRMode(unittest.TestCase):
         settings = calculate_vbr_settings(target_bitrate=3.0)
         
         self.assertEqual(settings['b:v'], 3.0)
-        self.assertAlmostEqual(settings['maxrate'], 3.15, places=2)
+        self.assertAlmostEqual(settings['maxrate'], 3.30, places=2)
         self.assertAlmostEqual(settings['bufsize'], 7.5, places=2)
     
     def test_vbr_update_emergency(self):

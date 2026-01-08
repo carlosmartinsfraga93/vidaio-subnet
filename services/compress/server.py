@@ -415,93 +415,6 @@ async def list_logged_videos():
     }
 
 
-def classify_scene_early(video_path: str, logging_enabled: bool = True) -> str:
-    """
-    Perform early scene classification before encoding.
-
-    This function extracts a few frames and classifies the scene type
-    to determine minimum bitrate requirements for VBR mode.
-
-    Args:
-        video_path: Path to input video file
-        logging_enabled: Whether to print classification logs
-
-    Returns:
-        Scene type string (high-action, medium-action, low-action, animation, default)
-    """
-    try:
-        import tempfile
-        import shutil
-        from utils.processing_utils import USE_CLIP_CLASSIFICATION
-
-        if logging_enabled:
-            print(f"\n🎬 Early Scene Classification (for bitrate calculation)")
-
-        # Create temporary directory for frames
-        temp_dir = tempfile.mkdtemp(prefix='early_scene_')
-
-        try:
-            # Use CLIP if enabled (faster), otherwise use MobileNetV3
-            if USE_CLIP_CLASSIFICATION:
-                from utils.classify_scene_clip import classify_scene_with_clip
-                classification_label, detailed_results, _ = classify_scene_with_clip(
-                    scene_path=video_path,
-                    temp_dir=temp_dir,
-                    num_frames=3,  # Quick classification with 3 frames
-                    device='cuda' if os.path.exists('/dev/nvidia0') else 'cpu',
-                    logging_enabled=logging_enabled
-                )
-            else:
-                # Use MobileNetV3 classifier
-                from utils.processing_utils import classify_scene_from_path
-
-                # Get cached models
-                config = _get_default_config()
-                resources = get_cached_models(config, logging_enabled=False)
-
-                classification_label, detailed_results, _ = classify_scene_from_path(
-                    scene_path=video_path,
-                    temp_dir=temp_dir,
-                    scene_classifier_model=resources['scene_classifier_model'],
-                    available_metrics=resources['available_metrics'],
-                    device=resources['device'],
-                    metrics_scaler=resources['feature_scaler_step'],
-                    class_mapping=resources['class_mapping'],
-                    logging_enabled=logging_enabled,
-                    num_frames=3  # Quick classification
-                )
-
-            # Map classification to scene type
-            scene_type_mapping = {
-                'Gaming Content': 'high-action',
-                'Faces / People': 'low-action',
-                'Screen Content / Text': 'low-action',
-                'Animation / Cartoon / Rendered Graphics': 'animation',
-                'Other': 'default',
-                'unclear': 'default'
-            }
-
-            scene_type = scene_type_mapping.get(classification_label, 'default')
-
-            if logging_enabled:
-                print(f"   Classification: {classification_label} → Scene type: {scene_type}")
-
-            return scene_type
-
-        finally:
-            # Cleanup temp directory
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception:
-                pass
-
-    except Exception as e:
-        if logging_enabled:
-            print(f"   ⚠️ Early scene classification failed: {e}")
-            print(f"   Using default scene type for bitrate calculation")
-        return 'default'
-
-
 @app.post("/compress-video")
 async def compress_video(video: CompressPayload, background_tasks: BackgroundTasks):
     """
@@ -584,198 +497,20 @@ async def compress_video(video: CompressPayload, background_tasks: BackgroundTas
     output_dir = Path(video.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Calculate intelligent target bitrate for VBR mode
-    # For VBR mode, we need to set an appropriate bitrate cap to achieve compression
-    # while maintaining target VMAF quality
-    calculated_target_bitrate = video.target_bitrate
-    original_video_bitrate = None  # Track original bitrate for logging
-    has_complexity = False  # Track if content complexity was detected (default: simple content)
-
-    if forced_codec_mode == 'VBR':
-        try:
-            # STEP 1: Perform early scene classification AND get video metrics
-            scene_type = classify_scene_early(str(input_file), logging_enabled=True)
-
-            # STEP 1.5: Get video complexity metrics for bitrate adjustment
-            from utils.analyze_video_fast import analyze_video_fast
-            video_metrics = analyze_video_fast(str(input_file), max_frames=30, logging_enabled=False)
-            if not video_metrics:
-                video_metrics = {}  # Fallback to empty dict if analysis fails
-
-            # STEP 2: Get input video bitrate
-            import subprocess
-            probe_cmd = [
-                'ffprobe', '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=bit_rate',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                str(input_file)
-            ]
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-
-            if result.returncode == 0 and result.stdout.strip():
-                input_bitrate_bps = int(result.stdout.strip())
-                input_bitrate_mbps = input_bitrate_bps / 1_000_000
-                original_video_bitrate = input_bitrate_mbps  # Store for logging
-
-                # STEP 3: Calculate target bitrate based on quality level and codec efficiency
-                # DYNAMIC COMPRESSION: Balanced multipliers that adapt to input bitrate and complexity
-                # These work with CQ values to find optimal bitrate for VMAF target
-                codec_efficiency = {
-                    'av1_nvenc': 0.25,      # AV1: 75% reduction vs H.264 (realistic compression)
-                    'hevc_nvenc': 0.35,     # HEVC: 65% reduction vs H.264
-                    'h264_nvenc': 0.50,     # H.264: 50% reduction with better encoding
-                    'libx265': 0.35,        # Same as hevc_nvenc
-                    'libx264': 0.50,        # Same as h264_nvenc
-                    'libsvtav1': 0.25,      # Same as av1_nvenc
-                    'libvpx-vp9': 0.30      # VP9 between AV1 and HEVC
-                }.get(ffmpeg_codec, 0.40)  # Default to 40% for unknown codecs
-
-                # Adjust based on target quality
-                # DYNAMIC: Quality multipliers work with complexity detection
-                # Lower multipliers for easier content, higher for complex content
-                quality_multiplier = {
-                    'High': 0.9,    # VMAF 93 - Needs more bitrate for quality
-                    'Medium': 0.7,  # VMAF 89 - Balanced approach
-                    'Low': 0.5      # VMAF 85 - More aggressive compression
-                }.get(target_quality, 0.7)
-
-                # Calculate target: input_bitrate * codec_efficiency * quality_multiplier
-                calculated_target_bitrate = input_bitrate_mbps * codec_efficiency * quality_multiplier
-
-                # STEP 4: Calculate formula-based bitrate target
-                # Uses production-validated formula: B_target = B_base × (W×H / 1920×1080) × (FPS / 30)
-                from config.advanced_encoding_config import calculate_formula_based_bitrate_target
-
-                # Get video properties for formula
-                width = video_metrics.get('width', 1920)
-                height = video_metrics.get('height', 1080)
-                fps = video_metrics.get('fps', 30.0)
-
-                # Calculate scene-specific bitrate target
-                formula_based_target = calculate_formula_based_bitrate_target(
-                    scene_type=scene_type,
-                    width=width,
-                    height=height,
-                    fps=fps
-                )
-
-                print(f"   📐 Formula-based target: {formula_based_target:.2f} Mbps")
-                print(f"      Scene: {scene_type}, Resolution: {width}x{height}, FPS: {fps}")
-
-                # Use formula-based target as minimum
-                min_required_bitrate = formula_based_target
-
-                # STEP 4.5: Adjust minimum bitrate based on content complexity
-                # If video has high noise, motion, or texture, increase minimum bitrate
-                complexity_multiplier = 1.0
-                complexity_factors = []
-                has_complexity = False  # Track if any complexity was detected
-
-                # Check grain/noise level (high noise needs more bitrate)
-                grain_noise = video_metrics.get('metrics_avg_grain_noise', 0)
-                if grain_noise > 10:  # High noise threshold
-                    complexity_multiplier *= 1.3
-                    complexity_factors.append(f"high noise ({grain_noise:.1f})")
-                    has_complexity = True
-                elif grain_noise > 7:  # Medium noise
-                    complexity_multiplier *= 1.15
-                    complexity_factors.append(f"medium noise ({grain_noise:.1f})")
-                    has_complexity = True
-
-                # Check motion level (high motion needs more bitrate)
-                motion = video_metrics.get('metrics_avg_motion', 0)
-                if motion > 0.15:  # High motion threshold
-                    complexity_multiplier *= 1.25
-                    complexity_factors.append(f"high motion ({motion:.3f})")
-                    has_complexity = True
-                elif motion > 0.10:  # Medium motion
-                    complexity_multiplier *= 1.1
-                    complexity_factors.append(f"medium motion ({motion:.3f})")
-                    has_complexity = True
-
-                # Check texture complexity (complex textures need more bitrate)
-                texture = video_metrics.get('metrics_avg_texture', 0)
-                if texture > 6.5:  # High texture complexity
-                    complexity_multiplier *= 1.2
-                    complexity_factors.append(f"high texture ({texture:.1f})")
-                    has_complexity = True
-                elif texture > 5.5:  # Medium texture
-                    complexity_multiplier *= 1.1
-                    complexity_factors.append(f"medium texture ({texture:.1f})")
-                    has_complexity = True
-
-                # Apply complexity adjustment to minimum bitrate
-                if complexity_multiplier > 1.0:
-                    original_min = min_required_bitrate
-                    min_required_bitrate *= complexity_multiplier
-                    print(f"   ⚠️ Content complexity detected: {', '.join(complexity_factors)}")
-                    print(f"   📈 Adjusted minimum bitrate: {original_min:.2f} → {min_required_bitrate:.2f} Mbps ({complexity_multiplier:.2f}x)")
-
-                # STEP 5: Smart bitrate selection strategy
-                # 5.1: Pick minimum of calculated and requested (prefer lower bitrate for efficiency)
-                picked_bitrate = min(calculated_target_bitrate, video.target_bitrate)
-
-                # 5.2: Compare with minimum required bitrate
-                if picked_bitrate < min_required_bitrate:
-                    # Picked is too low - use minimum required
-                    final_bitrate = min_required_bitrate
-                    selection_reason = f"Picked {picked_bitrate:.2f} < minimum {min_required_bitrate:.2f}, using minimum"
-                else:
-                    # Picked is sufficient - check if original bitrate is lower than requested
-                    # BUT only use original if it's high enough (at least 1.5x minimum required)
-                    if input_bitrate_mbps < video.target_bitrate and input_bitrate_mbps >= min_required_bitrate * 1.5:
-                        # Original is lower than requested AND sufficient for quality - use it
-                        final_bitrate = input_bitrate_mbps
-                        selection_reason = f"Original {input_bitrate_mbps:.2f} < requested {video.target_bitrate:.2f} and sufficient (≥{min_required_bitrate*1.5:.1f}), using original"
-                    else:
-                        # Use middle value between picked and minimum
-                        final_bitrate = (picked_bitrate + min_required_bitrate) / 2
-                        selection_reason = f"Using middle value between picked {picked_bitrate:.2f} and minimum {min_required_bitrate:.2f}"
-
-                # STEP 5.5: Apply efficiency multiplier for simple content
-                # DYNAMIC: For simple content, we can compress more efficiently
-                # For complex content (has_complexity=True), use 100% of calculated bitrate
-                # For simple content (has_complexity=False), use 70% for better efficiency
-                if not has_complexity:
-                    efficiency_multiplier = 0.70  # Balanced reduction for simple content
-                    original_final = final_bitrate
-                    final_bitrate *= efficiency_multiplier
-                    print(f"   💡 Simple content detected - applying {efficiency_multiplier}x efficiency multiplier")
-                    print(f"   📉 Adjusted final bitrate: {original_final:.2f} → {final_bitrate:.2f} Mbps")
-
-                print(f"📊 VBR Bitrate Calculation:")
-                print(f"   Scene type: {scene_type}")
-                print(f"   Input bitrate: {input_bitrate_mbps:.2f} Mbps")
-                print(f"   Codec efficiency: {codec_efficiency*100:.0f}%")
-                print(f"   Quality multiplier: {quality_multiplier}x")
-                print(f"   Calculated target: {calculated_target_bitrate:.2f} Mbps")
-                print(f"   User requested: {video.target_bitrate:.2f} Mbps")
-                print(f"   Picked (min of above): {picked_bitrate:.2f} Mbps")
-                print(f"   Minimum required: {min_required_bitrate:.2f} Mbps (for {scene_type} + {target_quality})")
-                print(f"   Selection: {selection_reason}")
-                print(f"   Final target: {final_bitrate:.2f} Mbps")
-
-                calculated_target_bitrate = final_bitrate
-            else:
-                print(f"⚠️ Could not detect input bitrate, using user-specified: {video.target_bitrate} Mbps")
-        except Exception as e:
-            print(f"⚠️ Error calculating target bitrate: {e}, using user-specified: {video.target_bitrate} Mbps")
 
     # Perform video compression (use forced VBR mode)
     try:
-        # BUG FIX #1: Pass minimum required bitrate to video_compressor
+        # Optimal controller will handle all bitrate decisions
         compressed_video_path = video_compressor(
             input_file=str(input_file),
             target_quality=target_quality,
             target_codec=ffmpeg_codec,
             codec_mode=forced_codec_mode,  # Use forced VBR mode
-            target_bitrate=calculated_target_bitrate,
+            target_bitrate=video.target_bitrate,
             max_duration=video.max_duration,
             output_dir=str(output_dir),
             skip_scene_detection=True,  # Skip for miner chunks (already pre-split)
-            skip_preprocessing=True,  # Skip for miner chunks (already compressed)
-            min_required_bitrate=min_required_bitrate if 'min_required_bitrate' in locals() else None
+            skip_preprocessing=True  # Skip for miner chunks (already compressed)
         )
         print(f"compressed_video_path: {compressed_video_path}")
 
@@ -859,18 +594,18 @@ async def compress_video(video: CompressPayload, background_tasks: BackgroundTas
                                 compression_ratio=compression_ratio,
                                 codec=ffmpeg_codec,
                                 codec_mode=forced_codec_mode,  # Actual mode used (always VBR)
-                                original_bitrate=original_video_bitrate,  # Original video bitrate
-                                target_bitrate=calculated_target_bitrate,  # Applied bitrate (after minimum bitrate logic)
+                                original_bitrate=None,  # Will be calculated by VMAF logger
+                                target_bitrate=video.target_bitrate,  # Requested bitrate (optimal controller decides final)
                                 requested_bitrate=video.target_bitrate,  # User-requested bitrate
                                 requested_mode=original_codec_mode,  # Originally requested mode (CRF/VBR)
                                 validator_uid=video.validator_uid,
                                 validator_hotkey=video.validator_hotkey,
                                 environment=environment,
                                 source_request_id=video.source_request_id,  # For test comparisons
-                                video_analysis=video_metrics,  # Video complexity analysis
-                                width=video_metrics.get('metrics_resolution_width'),  # Extract from video_metrics
-                                height=video_metrics.get('metrics_resolution_height'),  # Extract from video_metrics
-                                fps=video_metrics.get('metrics_frame_rate')  # Extract from video_metrics
+                                video_analysis=None,  # Optimal controller handles complexity analysis
+                                width=None,  # Will be extracted by VMAF logger
+                                height=None,  # Will be extracted by VMAF logger
+                                fps=None  # Will be extracted by VMAF logger
                             )
                             print(f"📊 Scheduled async VMAF calculation for request {request_id}")
                         else:
@@ -1043,8 +778,7 @@ def video_compressor(
     max_duration: int = 3600,
     output_dir: str = './output',
     skip_scene_detection: bool = True,
-    skip_preprocessing: bool = True,
-    min_required_bitrate: Optional[float] = None
+    skip_preprocessing: bool = True
 ) -> Optional[str]:
     """
     Main video compression pipeline orchestrator.
@@ -1054,7 +788,7 @@ def video_compressor(
         target_quality: Target quality level ('High', 'Medium', 'Low')
         target_codec: FFmpeg encoder name (e.g., 'av1_nvenc', 'hevc_nvenc', 'libx264')
         codec_mode: Encoding mode - 'CRF' (Constant Rate Factor), 'CBR' (Constant Bitrate), 'VBR' (Variable Bitrate)
-        target_bitrate: Target bitrate in Mbps (used for CBR/VBR modes)
+        target_bitrate: Target bitrate in Mbps (used for CBR/VBR modes, optimal controller decides final value)
         max_duration: Maximum allowed video duration in seconds
         output_dir: Output directory for final files
         skip_scene_detection: If True, treats entire video as single scene (default: True for miner chunks)
@@ -1080,9 +814,6 @@ def video_compressor(
     config['video_processing']['target_codec'] = target_codec
     config['video_processing']['codec_mode'] = codec_mode
     config['video_processing']['target_bitrate'] = target_bitrate
-    # BUG FIX #1: Add minimum required bitrate to config
-    if min_required_bitrate is not None:
-        config['video_processing']['min_required_bitrate'] = min_required_bitrate
 
     # ============================================================================
     # NETFLIX PER-TITLE ENCODING CONFIGURATION
